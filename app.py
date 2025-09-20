@@ -211,7 +211,7 @@ def create_group(name: str, city: str, venue: str, weekday: int, start_time: str
         conn.exec_driver_sql(
             f"""
             INSERT INTO {DB_SCHEMA}.memberships (user_id, group_id, role)
-            VALUES (:u, :g, 'moderator')
+            VALUES (%(u)s, %(g)s, 'moderator')
             ON CONFLICT (user_id, group_id) DO NOTHING;
             """,
             {"u": created_by, "g": gid},
@@ -255,7 +255,7 @@ def join_group(user_id: int, group_id: int):
         conn.exec_driver_sql(
             f"""
             INSERT INTO {DB_SCHEMA}.memberships (user_id, group_id, role)
-            VALUES (:u, :g, 'member')
+            VALUES (%(u)s, %(g)s, 'member')
             ON CONFLICT (user_id, group_id) DO NOTHING;
             """,
             {"u": int(user_id), "g": int(group_id)},
@@ -287,7 +287,7 @@ def sign_up(event_id: int, user_id: int):
         conn.exec_driver_sql(
             f"""
             INSERT INTO {DB_SCHEMA}.event_signups (event_id, user_id, signed_at)
-            VALUES (:e, :u, :t)
+            VALUES (%(e)s, %(u)s, %(t)s)
             ON CONFLICT (event_id, user_id) DO NOTHING;
             """,
             {"e": int(event_id), "u": int(user_id), "t": now},
@@ -295,7 +295,7 @@ def sign_up(event_id: int, user_id: int):
         conn.exec_driver_sql(
             f"""
             INSERT INTO {DB_SCHEMA}.payments (event_id, user_id, user_marked_paid, moderator_confirmed)
-            VALUES (:e, :u, false, false)
+            VALUES (%(e)s, %(u)s, false, false)
             ON CONFLICT (event_id, user_id) DO NOTHING;
             """,
             {"e": int(event_id), "u": int(user_id)},
@@ -303,15 +303,21 @@ def sign_up(event_id: int, user_id: int):
 
 def withdraw(event_id: int, user_id: int):
     with engine.begin() as conn:
-        conn.exec_driver_sql(f"DELETE FROM {DB_SCHEMA}.payments WHERE event_id=:e AND user_id=:u", {"e": int(event_id), "u": int(user_id)})
-        conn.exec_driver_sql(f"DELETE FROM {DB_SCHEMA}.event_signups WHERE event_id=:e AND user_id=:u", {"e": int(event_id), "u": int(user_id)})
+        conn.exec_driver_sql(
+            f"DELETE FROM {DB_SCHEMA}.payments WHERE event_id=%(e)s AND user_id=%(u)s",
+            {"e": int(event_id), "u": int(user_id)}
+        )
+        conn.exec_driver_sql(
+            f"DELETE FROM {DB_SCHEMA}.event_signups WHERE event_id=%(e)s AND user_id=%(u)s",
+            {"e": int(event_id), "u": int(user_id)}
+        )
 
 def payment_toggle(event_id: int, user_id: int, field: str, value: int):
     if field not in ("user_marked_paid", "moderator_confirmed"):
         return
     with engine.begin() as conn:
         conn.exec_driver_sql(
-            f"UPDATE {DB_SCHEMA}.payments SET {field}=:v WHERE event_id=:e AND user_id=:u",
+            f"UPDATE {DB_SCHEMA}.payments SET {field}=%(v)s WHERE event_id=%(e)s AND user_id=%(u)s",
             {"v": bool(value), "e": int(event_id), "u": int(user_id)},
         )
 
@@ -355,7 +361,7 @@ def add_member_to_team(team_id: int, user_id: int):
         conn.exec_driver_sql(
             f"""
             INSERT INTO {DB_SCHEMA}.team_members (team_id, user_id)
-            VALUES (:t, :u)
+            VALUES (%(t)s, %(u)s)
             ON CONFLICT (team_id, user_id) DO NOTHING;
             """,
             {"t": int(team_id), "u": int(user_id)},
@@ -363,7 +369,10 @@ def add_member_to_team(team_id: int, user_id: int):
 
 def remove_member_from_team(team_id: int, user_id: int):
     with engine.begin() as conn:
-        conn.exec_driver_sql(f"DELETE FROM {DB_SCHEMA}.team_members WHERE team_id=:t AND user_id=:u", {"t": int(team_id), "u": int(user_id)})
+        conn.exec_driver_sql(
+            f"DELETE FROM {DB_SCHEMA}.team_members WHERE team_id=%(t)s AND user_id=%(u)s",
+            {"t": int(team_id), "u": int(user_id)}
+        )
 
 def list_team_members(team_id: int) -> pd.DataFrame:
     return pd.read_sql_query(
@@ -491,7 +500,7 @@ def render_event_card(event_id: int):
         else:
             with engine.begin() as conn:
                 pay = conn.exec_driver_sql(
-                    f"SELECT user_marked_paid FROM {DB_SCHEMA}.payments WHERE event_id=:e AND user_id=:u",
+                    f"SELECT user_marked_paid FROM {DB_SCHEMA}.payments WHERE event_id=%(e)s AND user_id=%(u)s",
                     {"e": int(e.id), "u": int(uid)}
                 ).first()
             can_signup = bool(pay and pay[0])
@@ -507,7 +516,7 @@ def render_event_card(event_id: int):
             row = None
             with engine.begin() as conn:
                 row = conn.exec_driver_sql(
-                    f"SELECT user_marked_paid FROM {DB_SCHEMA}.payments WHERE event_id=:e AND user_id=:u",
+                    f"SELECT user_marked_paid FROM {DB_SCHEMA}.payments WHERE event_id=%(e)s AND user_id=%(u)s",
                     {"e": int(e.id), "u": int(uid)}
                 ).first()
             cur_val = bool(row[0]) if row else False
