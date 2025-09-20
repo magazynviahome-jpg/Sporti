@@ -7,7 +7,7 @@ from typing import Optional, List, Tuple
 import pandas as pd
 import streamlit as st
 from sqlalchemy import (
-    create_engine, MetaData, Table, Column, Integer, String, Text,
+    create_engine, MetaData, Table, Column, Integer, String,
     DateTime, Boolean, ForeignKey, UniqueConstraint, select, func,
     insert, update, and_, text
 )
@@ -138,15 +138,10 @@ goals = Table(
 def init_db():
     """Create tables and add missing columns (idempotent)."""
     metadata.create_all(engine)
-    # defensywnie: dodaj brakujące kolumny (gdy tabele powstały wcześniej innym skryptem)
     with engine.begin() as conn:
-        # groups: duration_minutes
         conn.exec_driver_sql(f"ALTER TABLE {DB_SCHEMA}.groups ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 60;")
-        # groups: blik_phone
         conn.exec_driver_sql(f"ALTER TABLE {DB_SCHEMA}.groups ADD COLUMN IF NOT EXISTS blik_phone TEXT NOT NULL DEFAULT '';")
-        # memberships: role
         conn.exec_driver_sql(f"ALTER TABLE {DB_SCHEMA}.memberships ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'member';")
-        # indeksy
         conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_events_group_starts ON {DB_SCHEMA}.events (group_id, starts_at);")
         conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_signups_event ON {DB_SCHEMA}.event_signups (event_id);")
         conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_payments_event_user ON {DB_SCHEMA}.payments (event_id, user_id);")
@@ -213,7 +208,6 @@ def create_group(name: str, city: str, venue: str, weekday: int, start_time: str
                 created_by=created_by
             ).returning(groups.c.id)
         ).scalar_one())
-        # creator becomes moderator (upsert)
         conn.exec_driver_sql(
             f"""
             INSERT INTO {DB_SCHEMA}.memberships (user_id, group_id, role)
@@ -251,7 +245,7 @@ def list_groups_for_user(user_id: int) -> pd.DataFrame:
            CASE WHEN m.role='moderator' THEN 1 ELSE 0 END AS is_mod
     FROM {DB_SCHEMA}.groups g
     JOIN {DB_SCHEMA}.memberships m ON m.group_id=g.id
-    WHERE m.user_id=:uid
+    WHERE m.user_id=%(uid)s
     ORDER BY g.city, g.name
     """
     return pd.read_sql_query(sql, engine, params={"uid": int(user_id)})
@@ -281,7 +275,7 @@ def events_df(group_id: int, only_future: bool = True) -> pd.DataFrame:
         cond = "starts_at >= NOW() - interval '1 day'"
     else:
         cond = "datetime(starts_at) >= datetime('now','-1 day')"
-    base = f"SELECT id, starts_at, price_cents, locked FROM {DB_SCHEMA}.events WHERE group_id=:gid"
+    base = f"SELECT id, starts_at, price_cents, locked FROM {DB_SCHEMA}.events WHERE group_id=%(gid)s"
     if only_future:
         base += f" AND {cond}"
     base += " ORDER BY starts_at"
@@ -335,13 +329,14 @@ def get_event_context(event_id: int):
         FROM {DB_SCHEMA}.event_signups es
         JOIN {DB_SCHEMA}.users u ON u.id=es.user_id
         LEFT JOIN {DB_SCHEMA}.payments p ON p.event_id=es.event_id AND p.user_id=es.user_id
-        WHERE es.event_id=:eid
+        WHERE es.event_id=%(eid)s
         ORDER BY u.name
         """
         signups_df = pd.read_sql_query(signups_sql, engine, params={"eid": int(event_id)})
 
         teams_df = pd.read_sql_query(
-            f"SELECT id, name, idx, goals FROM {DB_SCHEMA}.teams WHERE event_id=:eid ORDER BY idx", engine, params={"eid": int(event_id)}
+            f"SELECT id, name, idx, goals FROM {DB_SCHEMA}.teams WHERE event_id=%(eid)s ORDER BY idx",
+            engine, params={"eid": int(event_id)}
         )
     return e, signups_df, teams_df
 
@@ -375,7 +370,7 @@ def list_team_members(team_id: int) -> pd.DataFrame:
         f"""
         SELECT tm.user_id, u.name
         FROM {DB_SCHEMA}.team_members tm JOIN {DB_SCHEMA}.users u ON u.id=tm.user_id
-        WHERE tm.team_id=:tid ORDER BY u.name
+        WHERE tm.team_id=%(tid)s ORDER BY u.name
         """,
         engine, params={"tid": int(team_id)}
     )
@@ -399,14 +394,17 @@ def goals_df(event_id: int) -> pd.DataFrame:
         LEFT JOIN {DB_SCHEMA}.users s ON s.id=g.scorer_id
         LEFT JOIN {DB_SCHEMA}.users a ON a.id=g.assist_id
         LEFT JOIN {DB_SCHEMA}.teams t ON t.id=g.team_id
-        WHERE g.event_id=:eid
+        WHERE g.event_id=%(eid)s
         ORDER BY COALESCE(g.minute, 0), g.id
         """,
         engine, params={"eid": int(event_id)}
     )
 
 def total_team_goals(event_id: int) -> Tuple[int, List[int]]:
-    df = pd.read_sql_query(f"SELECT goals FROM {DB_SCHEMA}.teams WHERE event_id=:eid ORDER BY idx", engine, params={"eid": int(event_id)})
+    df = pd.read_sql_query(
+        f"SELECT goals FROM {DB_SCHEMA}.teams WHERE event_id=%(eid)s ORDER BY idx",
+        engine, params={"eid": int(event_id)}
+    )
     ls = df["goals"].astype(int).tolist() if not df.empty else []
     return sum(ls), ls
 
@@ -417,7 +415,7 @@ def computed_stats(group_id: int, year: int) -> pd.DataFrame:
             f"""
             SELECT g.event_id, g.scorer_id, g.assist_id
             FROM {DB_SCHEMA}.goals g JOIN {DB_SCHEMA}.events e ON e.id=g.event_id
-            WHERE e.group_id=:gid AND EXTRACT(YEAR FROM e.starts_at)=:yr
+            WHERE e.group_id=%(gid)s AND EXTRACT(YEAR FROM e.starts_at)=%(yr)s
             """,
             engine, params={"gid": int(group_id), "yr": int(year)}
         )
@@ -426,7 +424,7 @@ def computed_stats(group_id: int, year: int) -> pd.DataFrame:
             f"""
             SELECT g.event_id, g.scorer_id, g.assist_id
             FROM {DB_SCHEMA}.goals g JOIN {DB_SCHEMA}.events e ON e.id=g.event_id
-            WHERE e.group_id=:gid AND strftime('%Y', e.starts_at)=:yr
+            WHERE e.group_id=%(gid)s AND strftime('%Y', e.starts_at)=%(yr)s
             """,
             engine, params={"gid": int(group_id), "yr": f"{year:04d}"}
         )
@@ -435,11 +433,13 @@ def computed_stats(group_id: int, year: int) -> pd.DataFrame:
         f"""
         SELECT t.event_id, t.id AS team_id, tm.user_id, t.goals
         FROM {DB_SCHEMA}.teams t JOIN {DB_SCHEMA}.team_members tm ON tm.team_id=t.id
-        WHERE t.event_id IN (SELECT id FROM {DB_SCHEMA}.events WHERE group_id=:gid)
+        WHERE t.event_id IN (SELECT id FROM {DB_SCHEMA}.events WHERE group_id=%(gid)s)
         """,
         engine, params={"gid": int(group_id)}
     )
-    df_tg = pd.read_sql_query(f"SELECT event_id, MAX(goals) AS maxg FROM {DB_SCHEMA}.teams GROUP BY event_id", engine)
+    df_tg = pd.read_sql_query(
+        f"SELECT event_id, MAX(goals) AS maxg FROM {DB_SCHEMA}.teams GROUP BY event_id", engine
+    )
 
     stats = {int(u): {"name": n, "goals": 0, "assists": 0, "wins": 0, "losses": 0, "draws": 0}
              for u, n in (df_users.itertuples(index=False) if not df_users.empty else [])}
@@ -783,7 +783,7 @@ def page_group_dashboard(group_id: int):
                 f"""
                 SELECT u.id AS user_id, u.name, m.role
                 FROM {DB_SCHEMA}.memberships m JOIN {DB_SCHEMA}.users u ON u.id=m.user_id
-                WHERE m.group_id=:gid
+                WHERE m.group_id=%(gid)s
                 ORDER BY u.name
                 """,
                 engine, params={"gid": gid}
