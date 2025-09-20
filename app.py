@@ -4,7 +4,25 @@ import pandas as pd
 from datetime import datetime, date, timedelta, time as dt_time
 from typing import Optional, List, Tuple
 
-DB_PATH = "futsal.db"
+# Resolve a writable location for the SQLite DB (works locally & on Streamlit Cloud)
+import os, tempfile
+from pathlib import Path
+
+def _resolve_db_path() -> str:
+    # 1) prefer ./data/futsal.db if writable
+    try:
+        data_dir = Path(os.getenv("FUTSAL_DATA_DIR", "data"))
+        data_dir.mkdir(parents=True, exist_ok=True)
+        test_file = data_dir / ".write_test"
+        test_file.write_text("ok")
+        test_file.unlink(missing_ok=True)
+        return str(data_dir / "futsal.db")
+    except Exception:
+        # 2) fallback to system temp (ephemeral in the cloud)
+        tmp = Path(tempfile.gettempdir()) / "futsal_fallback.db"
+        return str(tmp)
+
+DB_PATH = _resolve_db_path()
 APP_TITLE = "Futsal Manager"
 
 # ---------------------------
@@ -18,6 +36,12 @@ def get_conn():
 
 
 def init_db():
+    # Ensure DB file exists and is writable
+    db_parent = Path(DB_PATH).parent
+    db_parent.mkdir(parents=True, exist_ok=True)
+    
+    conn = get_conn()
+    cur = conn.cursor()
     conn = get_conn()
     cur = conn.cursor()
 
@@ -462,6 +486,8 @@ def computed_stats(group_id: int, year: int) -> pd.DataFrame:
 # ---------------------------
 
 def sidebar_auth():
+    st.sidebar.header("Logowanie")
+    st.sidebar.caption(f"🗄️ Baza: `{DB_PATH}`")
     st.sidebar.header("Logowanie")
     name = st.sidebar.text_input("Imię / nick", key="login_name")
     phone = st.sidebar.text_input("Telefon (opcjonalnie)")
