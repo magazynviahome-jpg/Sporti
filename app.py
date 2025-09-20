@@ -1,4 +1,4 @@
-# app.py — Futsal Manager (Streamlit + SQLAlchemy + Postgres/SQLite fallback)
+# app.py — Futsal Manager (Streamlit + SQLAlchemy Core + Postgres) z kwalifikacją schematu
 
 import os
 from datetime import datetime, date, timedelta, time as dt_time
@@ -11,8 +11,7 @@ from sqlalchemy import (
     DateTime, Boolean, ForeignKey, UniqueConstraint, select, func,
     insert, update, and_, text
 )
-from sqlalchemy.engine import Engine, Connection
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.engine import Engine
 
 APP_TITLE = "Futsal Manager (Postgres)"
 
@@ -20,23 +19,25 @@ APP_TITLE = "Futsal Manager (Postgres)"
 # DB init (Postgres from secrets, fallback to SQLite)
 # ---------------------------
 
+def _get_secret(name: str, default: str = "") -> str:
+    if name in st.secrets:
+        return st.secrets[name]
+    return os.getenv(name, default)
+
 def _get_database_url() -> str:
-    # 1) Streamlit secrets
-    if "DATABASE_URL" in st.secrets:
-        return st.secrets["DATABASE_URL"]
-    # 2) env var
-    if os.getenv("DATABASE_URL"):
-        return os.getenv("DATABASE_URL")
-    # 3) local fallback (SQLite file for dev)
+    if "DATABASE_URL" in st.secrets or os.getenv("DATABASE_URL"):
+        return _get_secret("DATABASE_URL")
     os.makedirs("data", exist_ok=True)
     return "sqlite:///data/futsal.db"
 
 DATABASE_URL = _get_database_url()
+DB_SCHEMA = _get_secret("DB_SCHEMA", "public").strip() or "public"
+
 engine: Engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
 metadata = MetaData()
 
 # ---------------------------
-# Tables (SQLAlchemy Core)
+# Tables (SQLAlchemy Core) — ze schematem
 # ---------------------------
 
 users = Table(
@@ -47,6 +48,7 @@ users = Table(
     Column("email", String(255)),
     Column("is_admin", Boolean, nullable=False, server_default=text("false") if engine.dialect.name != "sqlite" else text("0")),
     sqlite_autoincrement=True,
+    schema=DB_SCHEMA,
 )
 
 groups = Table(
@@ -55,79 +57,99 @@ groups = Table(
     Column("name", String(255), nullable=False),
     Column("city", String(255), nullable=False),
     Column("venue", String(255), nullable=False),
-    Column("weekday", Integer, nullable=False),        # 0=Mon .. 6=Sun
-    Column("start_time", String(5), nullable=False),   # "HH:MM"
+    Column("weekday", Integer, nullable=False),
+    Column("start_time", String(5), nullable=False),
     Column("price_cents", Integer, nullable=False),
     Column("duration_minutes", Integer, nullable=False, server_default=text("60")),
-    Column("blik_phone", String(64), nullable=False),
-    Column("created_by", Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=False),
+    Column("blik_phone", String(64), nullable=False, server_default=text("''") if engine.dialect.name=="postgresql" else text("''")),
+    Column("created_by", Integer, ForeignKey(f"{DB_SCHEMA}.users.id", ondelete="SET NULL"), nullable=False),
     sqlite_autoincrement=True,
+    schema=DB_SCHEMA,
 )
 
 memberships = Table(
     "memberships", metadata,
-    Column("user_id", Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
-    Column("group_id", Integer, ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True),
-    Column("role", String(16), nullable=False, server_default=text("'member'") if engine.dialect.name != "sqlite" else text("'member'")),
+    Column("user_id", Integer, ForeignKey(f"{DB_SCHEMA}.users.id", ondelete="CASCADE"), primary_key=True),
+    Column("group_id", Integer, ForeignKey(f"{DB_SCHEMA}.groups.id", ondelete="CASCADE"), primary_key=True),
+    Column("role", String(16), nullable=False, server_default=text("'member'") if engine.dialect.name!="sqlite" else text("'member'")),
+    schema=DB_SCHEMA,
 )
 
 events = Table(
     "events", metadata,
     Column("id", Integer, primary_key=True),
-    Column("group_id", Integer, ForeignKey("groups.id", ondelete="CASCADE"), nullable=False),
+    Column("group_id", Integer, ForeignKey(f"{DB_SCHEMA}.groups.id", ondelete="CASCADE"), nullable=False),
     Column("starts_at", DateTime, nullable=False),
     Column("price_cents", Integer, nullable=False),
-    Column("generated", Boolean, nullable=False, server_default=text("true") if engine.dialect.name != "sqlite" else text("1")),
-    Column("locked", Boolean, nullable=False, server_default=text("false") if engine.dialect.name != "sqlite" else text("0")),
+    Column("generated", Boolean, nullable=False, server_default=text("true") if engine.dialect.name!="sqlite" else text("1")),
+    Column("locked", Boolean, nullable=False, server_default=text("false") if engine.dialect.name!="sqlite" else text("0")),
     sqlite_autoincrement=True,
+    schema=DB_SCHEMA,
 )
 
 event_signups = Table(
     "event_signups", metadata,
-    Column("event_id", Integer, ForeignKey("events.id", ondelete="CASCADE"), primary_key=True),
-    Column("user_id", Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+    Column("event_id", Integer, ForeignKey(f"{DB_SCHEMA}.events.id", ondelete="CASCADE"), primary_key=True),
+    Column("user_id", Integer, ForeignKey(f"{DB_SCHEMA}.users.id", ondelete="CASCADE"), primary_key=True),
     Column("signed_at", DateTime, nullable=False),
+    schema=DB_SCHEMA,
 )
 
 payments = Table(
     "payments", metadata,
-    Column("event_id", Integer, ForeignKey("events.id", ondelete="CASCADE"), primary_key=True),
-    Column("user_id", Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
-    Column("user_marked_paid", Boolean, nullable=False, server_default=text("false") if engine.dialect.name != "sqlite" else text("0")),
-    Column("moderator_confirmed", Boolean, nullable=False, server_default=text("false") if engine.dialect.name != "sqlite" else text("0")),
+    Column("event_id", Integer, ForeignKey(f"{DB_SCHEMA}.events.id", ondelete="CASCADE"), primary_key=True),
+    Column("user_id", Integer, ForeignKey(f"{DB_SCHEMA}.users.id", ondelete="CASCADE"), primary_key=True),
+    Column("user_marked_paid", Boolean, nullable=False, server_default=text("false") if engine.dialect.name!="sqlite" else text("0")),
+    Column("moderator_confirmed", Boolean, nullable=False, server_default=text("false") if engine.dialect.name!="sqlite" else text("0")),
+    schema=DB_SCHEMA,
 )
 
 teams = Table(
     "teams", metadata,
     Column("id", Integer, primary_key=True),
-    Column("event_id", Integer, ForeignKey("events.id", ondelete="CASCADE"), nullable=False),
+    Column("event_id", Integer, ForeignKey(f"{DB_SCHEMA}.events.id", ondelete="CASCADE"), nullable=False),
     Column("name", String(255), nullable=False),
-    Column("idx", Integer, nullable=False),  # 1..3
+    Column("idx", Integer, nullable=False),
     Column("goals", Integer, nullable=False, server_default=text("0")),
     UniqueConstraint("event_id", "idx", name="uq_teams_event_idx"),
     sqlite_autoincrement=True,
+    schema=DB_SCHEMA,
 )
 
 team_members = Table(
     "team_members", metadata,
-    Column("team_id", Integer, ForeignKey("teams.id", ondelete="CASCADE"), primary_key=True),
-    Column("user_id", Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+    Column("team_id", Integer, ForeignKey(f"{DB_SCHEMA}.teams.id", ondelete="CASCADE"), primary_key=True),
+    Column("user_id", Integer, ForeignKey(f"{DB_SCHEMA}.users.id", ondelete="CASCADE"), primary_key=True),
+    schema=DB_SCHEMA,
 )
 
 goals = Table(
     "goals", metadata,
     Column("id", Integer, primary_key=True),
-    Column("event_id", Integer, ForeignKey("events.id", ondelete="CASCADE"), nullable=False),
-    Column("scorer_id", Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=False),
-    Column("assist_id", Integer, ForeignKey("users.id", ondelete="SET NULL")),
-    Column("team_id", Integer, ForeignKey("teams.id", ondelete="SET NULL")),
+    Column("event_id", Integer, ForeignKey(f"{DB_SCHEMA}.events.id", ondelete="CASCADE"), nullable=False),
+    Column("scorer_id", Integer, ForeignKey(f"{DB_SCHEMA}.users.id", ondelete="SET NULL"), nullable=False),
+    Column("assist_id", Integer, ForeignKey(f"{DB_SCHEMA}.users.id", ondelete="SET NULL")),
+    Column("team_id", Integer, ForeignKey(f"{DB_SCHEMA}.teams.id", ondelete="SET NULL")),
     Column("minute", Integer),
     sqlite_autoincrement=True,
+    schema=DB_SCHEMA,
 )
 
 def init_db():
-    """Create tables if they don't exist."""
+    """Create tables and add missing columns (idempotent)."""
     metadata.create_all(engine)
+    # defensywnie: dodaj brakujące kolumny (gdy tabele powstały wcześniej innym skryptem)
+    with engine.begin() as conn:
+        # groups: duration_minutes
+        conn.exec_driver_sql(f"ALTER TABLE {DB_SCHEMA}.groups ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 60;")
+        # groups: blik_phone
+        conn.exec_driver_sql(f"ALTER TABLE {DB_SCHEMA}.groups ADD COLUMN IF NOT EXISTS blik_phone TEXT NOT NULL DEFAULT '';")
+        # memberships: role
+        conn.exec_driver_sql(f"ALTER TABLE {DB_SCHEMA}.memberships ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'member';")
+        # indeksy
+        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_events_group_starts ON {DB_SCHEMA}.events (group_id, starts_at);")
+        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_signups_event ON {DB_SCHEMA}.event_signups (event_id);")
+        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_payments_event_user ON {DB_SCHEMA}.payments (event_id, user_id);")
 
 # ---------------------------
 # Utils
@@ -165,16 +187,16 @@ def ensure_user(name: str, phone: str = "", email: str = "") -> int:
         )
         row = conn.execute(q).first()
         if row:
-            uid = row.id
+            uid = int(row.id)
             conn.execute(
                 update(users)
                 .where(users.c.id == uid)
                 .values(phone=phone or users.c.phone)
             )
         else:
-            uid = conn.execute(
+            uid = int(conn.execute(
                 insert(users).values(name=name, phone=phone or None, email=email or None).returning(users.c.id)
-            ).scalar_one()
+            ).scalar_one())
         return uid
 
 # ---------------------------
@@ -184,23 +206,22 @@ def ensure_user(name: str, phone: str = "", email: str = "") -> int:
 def create_group(name: str, city: str, venue: str, weekday: int, start_time: str,
                  price_cents: int, blik_phone: str, created_by: int, duration_minutes: int = 60) -> int:
     with engine.begin() as conn:
-        gid = conn.execute(
+        gid = int(conn.execute(
             insert(groups).values(
                 name=name, city=city, venue=venue, weekday=weekday, start_time=start_time,
                 price_cents=price_cents, duration_minutes=duration_minutes, blik_phone=blik_phone,
                 created_by=created_by
             ).returning(groups.c.id)
-        ).scalar_one()
-        # creator becomes moderator
-        # INSERT OR IGNORE equivalent:
-        if engine.dialect.name == "postgresql":
-            conn.execute(
-                pg_insert(memberships)
-                .values(user_id=created_by, group_id=gid, role="moderator")
-                .on_conflict_do_nothing(index_elements=[memberships.c.user_id, memberships.c.group_id])
-            )
-        else:
-            conn.execute(insert(memberships).prefix_with("OR IGNORE").values(user_id=created_by, group_id=gid, role="moderator"))
+        ).scalar_one())
+        # creator becomes moderator (upsert)
+        conn.exec_driver_sql(
+            f"""
+            INSERT INTO {DB_SCHEMA}.memberships (user_id, group_id, role)
+            VALUES (:u, :g, 'moderator')
+            ON CONFLICT (user_id, group_id) DO NOTHING;
+            """,
+            {"u": created_by, "g": gid},
+        )
         return gid
 
 def upsert_events_for_group(group_id: int, weeks_ahead: int = 12):
@@ -225,26 +246,26 @@ def upsert_events_for_group(group_id: int, weeks_ahead: int = 12):
                 )
 
 def list_groups_for_user(user_id: int) -> pd.DataFrame:
-    sql = """
+    sql = f"""
     SELECT g.id, g.name, g.city, g.venue, g.weekday, g.start_time, g.price_cents, g.duration_minutes, g.blik_phone,
            CASE WHEN m.role='moderator' THEN 1 ELSE 0 END AS is_mod
-    FROM groups g
-    JOIN memberships m ON m.group_id=g.id
+    FROM {DB_SCHEMA}.groups g
+    JOIN {DB_SCHEMA}.memberships m ON m.group_id=g.id
     WHERE m.user_id=:uid
     ORDER BY g.city, g.name
     """
-    return pd.read_sql_query(sql, engine, params={"uid": user_id})
+    return pd.read_sql_query(sql, engine, params={"uid": int(user_id)})
 
 def join_group(user_id: int, group_id: int):
     with engine.begin() as conn:
-        if engine.dialect.name == "postgresql":
-            conn.execute(
-                pg_insert(memberships)
-                .values(user_id=user_id, group_id=group_id, role="member")
-                .on_conflict_do_nothing(index_elements=[memberships.c.user_id, memberships.c.group_id])
-            )
-        else:
-            conn.execute(insert(memberships).prefix_with("OR IGNORE").values(user_id=user_id, group_id=group_id, role="member"))
+        conn.exec_driver_sql(
+            f"""
+            INSERT INTO {DB_SCHEMA}.memberships (user_id, group_id, role)
+            VALUES (:u, :g, 'member')
+            ON CONFLICT (user_id, group_id) DO NOTHING;
+            """,
+            {"u": int(user_id), "g": int(group_id)},
+        )
 
 def get_group(group_id: int):
     with engine.begin() as conn:
@@ -256,45 +277,48 @@ def get_group(group_id: int):
         ).first()
 
 def events_df(group_id: int, only_future: bool = True) -> pd.DataFrame:
-    base = "SELECT id, starts_at, price_cents, locked FROM events WHERE group_id=:gid"
+    if engine.dialect.name == "postgresql":
+        cond = "starts_at >= NOW() - interval '1 day'"
+    else:
+        cond = "datetime(starts_at) >= datetime('now','-1 day')"
+    base = f"SELECT id, starts_at, price_cents, locked FROM {DB_SCHEMA}.events WHERE group_id=:gid"
     if only_future:
-        if engine.dialect.name == "postgresql":
-            base += " AND starts_at >= NOW() - interval '1 day'"
-        else:
-            base += " AND datetime(starts_at) >= datetime('now','-1 day')"
+        base += f" AND {cond}"
     base += " ORDER BY starts_at"
-    return pd.read_sql_query(base, engine, params={"gid": group_id}, parse_dates=["starts_at"])
+    return pd.read_sql_query(base, engine, params={"gid": int(group_id)}, parse_dates=["starts_at"])
 
 def sign_up(event_id: int, user_id: int):
     now = datetime.now()
     with engine.begin() as conn:
-        # signups
-        if engine.dialect.name == "postgresql":
-            conn.execute(
-                pg_insert(event_signups)
-                .values(event_id=event_id, user_id=user_id, signed_at=now)
-                .on_conflict_do_nothing(index_elements=[event_signups.c.event_id, event_signups.c.user_id])
-            )
-            conn.execute(
-                pg_insert(payments)
-                .values(event_id=event_id, user_id=user_id, user_marked_paid=False, moderator_confirmed=False)
-                .on_conflict_do_nothing(index_elements=[payments.c.event_id, payments.c.user_id])
-            )
-        else:
-            conn.execute(insert(event_signups).prefix_with("OR IGNORE").values(event_id=event_id, user_id=user_id, signed_at=now))
-            conn.execute(insert(payments).prefix_with("OR IGNORE").values(event_id=event_id, user_id=user_id, user_marked_paid=False, moderator_confirmed=False))
+        conn.exec_driver_sql(
+            f"""
+            INSERT INTO {DB_SCHEMA}.event_signups (event_id, user_id, signed_at)
+            VALUES (:e, :u, :t)
+            ON CONFLICT (event_id, user_id) DO NOTHING;
+            """,
+            {"e": int(event_id), "u": int(user_id), "t": now},
+        )
+        conn.exec_driver_sql(
+            f"""
+            INSERT INTO {DB_SCHEMA}.payments (event_id, user_id, user_marked_paid, moderator_confirmed)
+            VALUES (:e, :u, false, false)
+            ON CONFLICT (event_id, user_id) DO NOTHING;
+            """,
+            {"e": int(event_id), "u": int(user_id)},
+        )
 
 def withdraw(event_id: int, user_id: int):
     with engine.begin() as conn:
-        conn.execute(payments.delete().where(and_(payments.c.event_id == event_id, payments.c.user_id == user_id)))
-        conn.execute(event_signups.delete().where(and_(event_signups.c.event_id == event_id, event_signups.c.user_id == user_id)))
+        conn.exec_driver_sql(f"DELETE FROM {DB_SCHEMA}.payments WHERE event_id=:e AND user_id=:u", {"e": int(event_id), "u": int(user_id)})
+        conn.exec_driver_sql(f"DELETE FROM {DB_SCHEMA}.event_signups WHERE event_id=:e AND user_id=:u", {"e": int(event_id), "u": int(user_id)})
 
 def payment_toggle(event_id: int, user_id: int, field: str, value: int):
+    if field not in ("user_marked_paid", "moderator_confirmed"):
+        return
     with engine.begin() as conn:
-        conn.execute(
-            update(payments)
-            .where(and_(payments.c.event_id == event_id, payments.c.user_id == user_id))
-            .values({field: bool(value)})
+        conn.exec_driver_sql(
+            f"UPDATE {DB_SCHEMA}.payments SET {field}=:v WHERE event_id=:e AND user_id=:u",
+            {"v": bool(value), "e": int(event_id), "u": int(user_id)},
         )
 
 def get_event_context(event_id: int):
@@ -304,114 +328,121 @@ def get_event_context(event_id: int):
             .where(events.c.id == event_id)
         ).first()
 
-        signups_sql = """
+        signups_sql = f"""
         SELECT es.user_id, u.name,
                COALESCE(p.user_marked_paid, false) AS user_marked_paid,
                COALESCE(p.moderator_confirmed, false) AS moderator_confirmed
-        FROM event_signups es
-        JOIN users u ON u.id=es.user_id
-        LEFT JOIN payments p ON p.event_id=es.event_id AND p.user_id=es.user_id
+        FROM {DB_SCHEMA}.event_signups es
+        JOIN {DB_SCHEMA}.users u ON u.id=es.user_id
+        LEFT JOIN {DB_SCHEMA}.payments p ON p.event_id=es.event_id AND p.user_id=es.user_id
         WHERE es.event_id=:eid
         ORDER BY u.name
         """
-        signups_df = pd.read_sql_query(signups_sql, engine, params={"eid": event_id})
+        signups_df = pd.read_sql_query(signups_sql, engine, params={"eid": int(event_id)})
 
         teams_df = pd.read_sql_query(
-            "SELECT id, name, idx, goals FROM teams WHERE event_id=:eid ORDER BY idx", engine, params={"eid": event_id}
+            f"SELECT id, name, idx, goals FROM {DB_SCHEMA}.teams WHERE event_id=:eid ORDER BY idx", engine, params={"eid": int(event_id)}
         )
     return e, signups_df, teams_df
 
 def set_team_goals(team_id: int, goals_value: int):
     with engine.begin() as conn:
-        conn.execute(update(teams).where(teams.c.id == team_id).values(goals=goals_value))
+        conn.execute(update(teams).where(teams.c.id == team_id).values(goals=int(goals_value)))
 
 def create_team_(event_id: int, name: str, idx: int) -> int:
     with engine.begin() as conn:
-        return conn.execute(
-            insert(teams).values(event_id=event_id, name=name, idx=idx, goals=0).returning(teams.c.id)
-        ).scalar_one()
+        return int(conn.execute(
+            insert(teams).values(event_id=int(event_id), name=name, idx=int(idx), goals=0).returning(teams.c.id)
+        ).scalar_one())
 
 def add_member_to_team(team_id: int, user_id: int):
     with engine.begin() as conn:
-        if engine.dialect.name == "postgresql":
-            conn.execute(
-                pg_insert(team_members).values(team_id=team_id, user_id=user_id)
-                .on_conflict_do_nothing(index_elements=[team_members.c.team_id, team_members.c.user_id])
-            )
-        else:
-            conn.execute(insert(team_members).prefix_with("OR IGNORE").values(team_id=team_id, user_id=user_id))
+        conn.exec_driver_sql(
+            f"""
+            INSERT INTO {DB_SCHEMA}.team_members (team_id, user_id)
+            VALUES (:t, :u)
+            ON CONFLICT (team_id, user_id) DO NOTHING;
+            """,
+            {"t": int(team_id), "u": int(user_id)},
+        )
 
 def remove_member_from_team(team_id: int, user_id: int):
     with engine.begin() as conn:
-        conn.execute(team_members.delete().where(and_(team_members.c.team_id == team_id, team_members.c.user_id == user_id)))
+        conn.exec_driver_sql(f"DELETE FROM {DB_SCHEMA}.team_members WHERE team_id=:t AND user_id=:u", {"t": int(team_id), "u": int(user_id)})
 
 def list_team_members(team_id: int) -> pd.DataFrame:
     return pd.read_sql_query(
-        """
+        f"""
         SELECT tm.user_id, u.name
-        FROM team_members tm JOIN users u ON u.id=tm.user_id
+        FROM {DB_SCHEMA}.team_members tm JOIN {DB_SCHEMA}.users u ON u.id=tm.user_id
         WHERE tm.team_id=:tid ORDER BY u.name
         """,
-        engine, params={"tid": team_id}
+        engine, params={"tid": int(team_id)}
     )
 
 def record_goal(event_id: int, scorer_id: int, assist_id: Optional[int], team_id: Optional[int], minute: Optional[int]):
     with engine.begin() as conn:
         conn.execute(
-            insert(goals).values(event_id=event_id, scorer_id=scorer_id,
-                                 assist_id=assist_id, team_id=team_id, minute=minute)
+            insert(goals).values(
+                event_id=int(event_id), scorer_id=int(scorer_id),
+                assist_id=int(assist_id) if assist_id else None,
+                team_id=int(team_id) if team_id else None,
+                minute=int(minute) if minute is not None else None
+            )
         )
 
 def goals_df(event_id: int) -> pd.DataFrame:
     return pd.read_sql_query(
-        """
+        f"""
         SELECT g.id, g.minute, s.name AS scorer, a.name AS assist, t.name AS team
-        FROM goals g
-        LEFT JOIN users s ON s.id=g.scorer_id
-        LEFT JOIN users a ON a.id=g.assist_id
-        LEFT JOIN teams t ON t.id=g.team_id
+        FROM {DB_SCHEMA}.goals g
+        LEFT JOIN {DB_SCHEMA}.users s ON s.id=g.scorer_id
+        LEFT JOIN {DB_SCHEMA}.users a ON a.id=g.assist_id
+        LEFT JOIN {DB_SCHEMA}.teams t ON t.id=g.team_id
         WHERE g.event_id=:eid
         ORDER BY COALESCE(g.minute, 0), g.id
         """,
-        engine, params={"eid": event_id}
+        engine, params={"eid": int(event_id)}
     )
 
 def total_team_goals(event_id: int) -> Tuple[int, List[int]]:
-    df = pd.read_sql_query("SELECT goals FROM teams WHERE event_id=:eid ORDER BY idx", engine, params={"eid": event_id})
+    df = pd.read_sql_query(f"SELECT goals FROM {DB_SCHEMA}.teams WHERE event_id=:eid ORDER BY idx", engine, params={"eid": int(event_id)})
     ls = df["goals"].astype(int).tolist() if not df.empty else []
     return sum(ls), ls
 
 def computed_stats(group_id: int, year: int) -> pd.DataFrame:
-    with engine.begin() as conn:
-        df_users = pd.read_sql_query("SELECT id, name FROM users", engine)
+    df_users = pd.read_sql_query(f"SELECT id, name FROM {DB_SCHEMA}.users", engine)
+    if engine.dialect.name == "postgresql":
         df_g = pd.read_sql_query(
-            """
+            f"""
             SELECT g.event_id, g.scorer_id, g.assist_id
-            FROM goals g JOIN events e ON e.id=g.event_id
+            FROM {DB_SCHEMA}.goals g JOIN {DB_SCHEMA}.events e ON e.id=g.event_id
             WHERE e.group_id=:gid AND EXTRACT(YEAR FROM e.starts_at)=:yr
             """,
-            engine, params={"gid": group_id, "yr": year}
-        ) if engine.dialect.name == "postgresql" else pd.read_sql_query(
-            """
+            engine, params={"gid": int(group_id), "yr": int(year)}
+        )
+    else:
+        df_g = pd.read_sql_query(
+            f"""
             SELECT g.event_id, g.scorer_id, g.assist_id
-            FROM goals g JOIN events e ON e.id=g.event_id
+            FROM {DB_SCHEMA}.goals g JOIN {DB_SCHEMA}.events e ON e.id=g.event_id
             WHERE e.group_id=:gid AND strftime('%Y', e.starts_at)=:yr
-            """, engine, params={"gid": group_id, "yr": f"{year:04d}"}
-        )
-
-        df_tm = pd.read_sql_query(
-            """
-            SELECT t.event_id, t.id AS team_id, tm.user_id, t.goals
-            FROM teams t JOIN team_members tm ON tm.team_id=t.id
-            WHERE t.event_id IN (SELECT id FROM events WHERE group_id=:gid)
             """,
-            engine, params={"gid": group_id}
+            engine, params={"gid": int(group_id), "yr": f"{year:04d}"}
         )
 
-        df_tg = pd.read_sql_query("SELECT event_id, MAX(goals) AS maxg FROM teams GROUP BY event_id", engine)
+    df_tm = pd.read_sql_query(
+        f"""
+        SELECT t.event_id, t.id AS team_id, tm.user_id, t.goals
+        FROM {DB_SCHEMA}.teams t JOIN {DB_SCHEMA}.team_members tm ON tm.team_id=t.id
+        WHERE t.event_id IN (SELECT id FROM {DB_SCHEMA}.events WHERE group_id=:gid)
+        """,
+        engine, params={"gid": int(group_id)}
+    )
+    df_tg = pd.read_sql_query(f"SELECT event_id, MAX(goals) AS maxg FROM {DB_SCHEMA}.teams GROUP BY event_id", engine)
 
     stats = {int(u): {"name": n, "goals": 0, "assists": 0, "wins": 0, "losses": 0, "draws": 0}
-             for u, n in df_users.itertuples(index=False)} if not df_users.empty else {}
+             for u, n in (df_users.itertuples(index=False) if not df_users.empty else [])}
 
     for _, row in (df_g.iterrows() if not df_g.empty else []):
         if pd.notna(row["scorer_id"]):
@@ -429,13 +460,11 @@ def computed_stats(group_id: int, year: int) -> pd.DataFrame:
             elif int(r["goals"]) < int(r["maxg"]):
                 stats[int(r["user_id"])]["losses"] += 1
 
-    rows = [{"user_id": uid, **s} for uid, s in stats.items()]
-    out = pd.DataFrame(rows)
+    out = pd.DataFrame([{"user_id": uid, **s} for uid, s in stats.items()])
     if out.empty:
         return out
     out["points"] = out["wins"]*3 + out["draws"]
-    out = out.sort_values(["points","goals","assists"], ascending=False)
-    return out
+    return out.sort_values(["points","goals","assists"], ascending=False)
 
 # ---------------------------
 # UI helpers
@@ -460,13 +489,12 @@ def render_event_card(event_id: int):
                 withdraw(e.id, uid)
                 st.rerun()
         else:
-            # only after user marks "Zapłacę BLIK"
             with engine.begin() as conn:
-                pay = conn.execute(
-                    select(payments.c.user_marked_paid)
-                    .where(and_(payments.c.event_id == e.id, payments.c.user_id == uid))
+                pay = conn.exec_driver_sql(
+                    f"SELECT user_marked_paid FROM {DB_SCHEMA}.payments WHERE event_id=:e AND user_id=:u",
+                    {"e": int(e.id), "u": int(uid)}
                 ).first()
-            can_signup = bool(pay and pay.user_marked_paid)
+            can_signup = bool(pay and pay[0])
             if not can_signup:
                 c1.info("Aby zapisać się, kliknij najpierw 'Zapłacę BLIK' i opłać udział.")
             if can_signup and c1.button("Zapisz się", key=f"su_{e.id}"):
@@ -476,11 +504,13 @@ def render_event_card(event_id: int):
         with c2.expander("💳 Zapłacę BLIK"):
             st.markdown(f"**Numer do BLIK / telefon:** {blik_phone}")
             st.caption("Skopiuj numer, zapłać i oznacz poniżej.")
+            row = None
             with engine.begin() as conn:
-                row = conn.execute(
-                    select(payments.c.user_marked_paid).where(and_(payments.c.event_id == e.id, payments.c.user_id == uid))
+                row = conn.exec_driver_sql(
+                    f"SELECT user_marked_paid FROM {DB_SCHEMA}.payments WHERE event_id=:e AND user_id=:u",
+                    {"e": int(e.id), "u": int(uid)}
                 ).first()
-            cur_val = bool(row.user_marked_paid) if row else False
+            cur_val = bool(row[0]) if row else False
             new_val = st.checkbox("Oznaczam: zapłacone", value=cur_val, key=f"ump_{e.id}")
             if bool(new_val) != bool(cur_val):
                 payment_toggle(e.id, uid, 'user_marked_paid', int(bool(new_val)))
@@ -509,7 +539,7 @@ def render_event_card(event_id: int):
 
 def sidebar_auth():
     st.sidebar.header("Logowanie")
-    st.sidebar.caption(f"🔌 DB: `{engine.dialect.name}` · URL host: `{os.getenv('NEON_HOST', '') or '***'}`")
+    st.sidebar.caption(f"🔌 DB: `{engine.dialect.name}` · schema: `{DB_SCHEMA}`")
     name = st.sidebar.text_input("Imię / nick", key="login_name")
     phone = st.sidebar.text_input("Telefon (opcjonalnie)")
     email = st.sidebar.text_input("Email (opcjonalnie)")
@@ -526,12 +556,17 @@ def sidebar_auth():
     with st.sidebar.expander("🧪 Diagnostyka"):
         st.write({
             "engine": engine.dialect.name,
-            "DATABASE_URL_present": bool(os.getenv("DATABASE_URL") or "DATABASE_URL" in st.secrets),
+            "schema": DB_SCHEMA,
+            "DATABASE_URL_present": bool(("DATABASE_URL" in st.secrets) or os.getenv("DATABASE_URL")),
         })
         try:
-            with engine.begin() as conn:
-                tables = pd.read_sql_query("SELECT table_name FROM information_schema.tables WHERE table_schema='public'" if engine.dialect.name=="postgresql"
-                                           else "SELECT name as table_name FROM sqlite_master WHERE type='table'", engine)
+            if engine.dialect.name == "postgresql":
+                tables = pd.read_sql_query(
+                    "SELECT table_name FROM information_schema.tables WHERE table_schema=%(s)s ORDER BY table_name",
+                    engine, params={"s": DB_SCHEMA}
+                )
+            else:
+                tables = pd.read_sql_query("SELECT name AS table_name FROM sqlite_master WHERE type='table' ORDER BY name", engine)
             st.write("Tabele:", tables["table_name"].tolist())
         except Exception as e:
             st.error(f"DB check error: {e}")
@@ -539,7 +574,7 @@ def sidebar_auth():
     if "user_id" in st.session_state:
         st.sidebar.info(f"Zalogowano jako: {st.session_state['user_name']}")
         if st.sidebar.button("Wyloguj"):
-            for k in ["user_id","user_name","selected_group_id","selected_event_id"]:
+            for k in ["user_id","user_name","selected_group_id","selected_event_id","nav"]:
                 st.session_state.pop(k, None)
             st.rerun()
 
@@ -745,9 +780,9 @@ def page_group_dashboard(group_id: int):
 
             st.markdown("### Zarządzanie członkami i rolami")
             members = pd.read_sql_query(
-                """
+                f"""
                 SELECT u.id AS user_id, u.name, m.role
-                FROM memberships m JOIN users u ON u.id=m.user_id
+                FROM {DB_SCHEMA}.memberships m JOIN {DB_SCHEMA}.users u ON u.id=m.user_id
                 WHERE m.group_id=:gid
                 ORDER BY u.name
                 """,
