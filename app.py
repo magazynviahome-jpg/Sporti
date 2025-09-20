@@ -1,8 +1,8 @@
 # app.py — Futsal Manager (Streamlit + SQLAlchemy Core + Postgres)
-# Zasady:
+# Zasady UX:
 # - Zapisy na "Nadchodzące" bez płatności.
-# - Płatność dopiero po wydarzeniu (zakładka "Po wydarzeniu"): wyliczamy kwotę = cena / liczba zapisanych.
-# - Jeśli masz nieopłacone minione wydarzenie w grupie, blokada zapisów na przyszłe.
+# - Płatność dopiero po wydarzeniu (zakładka "Po wydarzeniu"): kwota = cena / liczba zapisanych.
+# - Jeśli masz nieopłacone minione wydarzenie w grupie → blokada zapisów na przyszłe.
 # - Lista uczestników zawsze widoczna; przy płatnych ✅.
 # - Moderator = twórca grupy: może usuwać grupę i generować terminy.
 
@@ -39,11 +39,12 @@ def _get_database_url() -> str:
 DATABASE_URL = _get_database_url()
 DB_SCHEMA = _get_secret("DB_SCHEMA", "public").strip() or "public"
 
-engine: Engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+# mała pula wystarczy; pool_pre_ping=True wykrywa zryte połączenia
+engine: Engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=0, future=True)
 metadata = MetaData()
 
 # ---------------------------
-# Tables (SQLAlchemy Core) — ze schematem
+# Tabele (SQLAlchemy Core) — ze schematem
 # ---------------------------
 
 users = Table(
@@ -238,19 +239,19 @@ def is_moderator(user_id: int, group_id: int) -> bool:
 def user_has_unpaid_past(user_id: int, group_id: int) -> bool:
     """Czy użytkownik ma nieopłacone minione wydarzenie w tej grupie? (wg user_marked_paid=false)"""
     with engine.begin() as conn:
-        # pobieramy wydarzenia minione z zapisami usera i sprawdzamy payments.user_marked_paid
         sql = f"""
-        SELECT COUNT(*) AS cnt
-        FROM {DB_SCHEMA}.event_signups es
-        JOIN {DB_SCHEMA}.events e ON e.id=es.event_id
-        LEFT JOIN {DB_SCHEMA}.payments p ON p.event_id=es.event_id AND p.user_id=es.user_id
-        WHERE es.user_id=%(u)s
-          AND e.group_id=%(g)s
-          AND e.starts_at < NOW()
-          AND COALESCE(p.user_marked_paid, false) = false
+        SELECT EXISTS (
+          SELECT 1
+          FROM {DB_SCHEMA}.event_signups es
+          JOIN {DB_SCHEMA}.events e ON e.id=es.event_id
+          LEFT JOIN {DB_SCHEMA}.payments p ON p.event_id=es.event_id AND p.user_id=es.user_id
+          WHERE es.user_id=%(u)s
+            AND e.group_id=%(g)s
+            AND e.starts_at < NOW()
+            AND COALESCE(p.user_marked_paid, false) = false
+        ) AS has_debt
         """
-        cnt = conn.exec_driver_sql(sql, {"u": int(user_id), "g": int(group_id)}).scalar_one()
-        return int(cnt) > 0
+        return bool(conn.exec_driver_sql(sql, {"u": int(user_id), "g": int(group_id)}).scalar_one())
 
 # ---------------------------
 # Auth (lightweight)
@@ -335,7 +336,6 @@ def sign_up(event_id: int, user_id: int):
             """,
             {"e": int(event_id), "u": int(user_id), "t": now},
         )
-        # payments rekord niepotrzebny przed wydarzeniem (tworzymy po evencie, jeśli brak)
         conn.exec_driver_sql(
             f"""
             INSERT INTO {DB_SCHEMA}.payments (event_id, user_id, user_marked_paid, moderator_confirmed)
@@ -368,7 +368,7 @@ def payment_toggle(event_id: int, user_id: int, field: str, value: int):
         )
 
 # ---------------------------
-# Pobra­nia
+# Pobrania
 # ---------------------------
 
 def get_event(event_id: int):
@@ -421,25 +421,26 @@ def upcoming_event_view(event_id: int, uid: int, duration_minutes: int):
 
     # działania w formie – 1 rerun
     with st.form(f"up_ev_{event_id}", clear_on_submit=False):
-        c1, c2 = st.columns([1,3])
+        c1, _ = st.columns([1,3])
         if is_signed:
-            can_withdraw = not has_debt  # możesz się wypisać nawet z długiem, ale zostawiamy True – logicznie tak/nie wg preferencji
-            withdraw_btn = c1.form_submit_button("Wypisz się", disabled=not can_withdraw)
+            withdraw_btn = c1.form_submit_button("Wypisz się")
             if withdraw_btn:
-                withdraw(event_id, uid); cache_clear(); st.rerun()
+                withdraw(event_id, uid)
+                st.success("Wypisano.")
         else:
             signup_btn = c1.form_submit_button("Zapisz się", disabled=has_debt)
             if signup_btn:
-                sign_up(event_id, uid); cache_clear(); st.rerun()
+                sign_up(event_id, uid)
+                st.success("Zapisano na wydarzenie.")
         st.caption("Płatność za to wydarzenie będzie dostępna po jego zakończeniu.")
 
     st.markdown("**Uczestnicy (zapisani):**")
     if signups_df.empty:
         st.caption("Brak.")
     else:
-        # Po nadchodzącym wydarzeniu nie pokazujemy płatnych fajek – tylko listę
+        # ✅ Poprawka na KeyError: najpierw wybór 'name', potem rename → 'Uczestnik'
         st.dataframe(
-            signups_df.rename(columns={"name":"Uczestnik"})[["name"]].rename(columns={"name":"Uczestnik"}),
+            signups_df[["name"]].rename(columns={"name":"Uczestnik"}),
             hide_index=True, use_container_width=True
         )
 
@@ -455,7 +456,6 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
     st.markdown(f"**Numer do BLIK / telefon:** {blik_phone}")
 
     # Własna płatność
-    my_row = None
     if not signups_df.empty and uid in set(signups_df["user_id"]):
         my_row = signups_df[signups_df["user_id"] == uid].iloc[0]
         cur_paid = bool(my_row["user_marked_paid"])
@@ -464,7 +464,7 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
             paid_btn = st.form_submit_button("Zapisz")
             if paid_btn and bool(new_paid) != bool(cur_paid):
                 payment_toggle(event_id, uid, 'user_marked_paid', int(bool(new_paid)))
-                cache_clear(); st.rerun()
+                st.success("Zapisano status płatności.")
     else:
         st.info("Nie byłeś zapisany na to wydarzenie.")
 
@@ -485,16 +485,15 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
     if is_mod and not signups_df.empty:
         st.markdown("### Potwierdzenia moderatora")
         for _, r in signups_df.iterrows():
-            cols = st.columns([3,2,2])
+            cols = st.columns([3,2])
             cols[0].markdown(f"**{r['name']}**")
-            cols[1].checkbox("Zapłacone (użytk.)", value=bool(r['user_marked_paid']), disabled=True, key=f"v_u_{event_id}_{r['user_id']}")
-            cur_conf = bool(r['moderator_confirmed'])
-            with st.form(f"mf_{event_id}_{r['user_id']}"):
+            with cols[1].form(f"mf_{event_id}_{r['user_id']}"):
+                cur_conf = bool(r['moderator_confirmed'])
                 new_conf = st.checkbox("Potwierdź (mod)", value=cur_conf, key=f"m_{event_id}_{r['user_id']}")
                 save = st.form_submit_button("Zapisz")
                 if save and bool(new_conf) != bool(cur_conf):
                     payment_toggle(event_id, int(r['user_id']), 'moderator_confirmed', int(bool(new_conf)))
-                    cache_clear(); st.rerun()
+                    st.success("Zapisano.")
 
 # ---------------------------
 # UI — strony
@@ -575,8 +574,8 @@ def page_groups():
                         int(weekday), start_time.strip(),
                         int(round(price * 100)), blik.strip(), int(uid), int(duration_minutes)
                     )
+                    # generowanie terminów możesz też robić z panelu admina
                     upsert_events_for_group(gid)
-                    cache_clear()
                     st.session_state["selected_group_id"] = int(gid)
                     st.session_state["go_panel"] = True
                     st.success("Grupa utworzona. Przechodzę do panelu…")
@@ -621,10 +620,10 @@ def page_group_dashboard(group_id: int):
     uid = int(st.session_state.get("user_id"))
     mod = is_moderator(uid, gid)
 
-    tabs = st.tabs(["Nadchodzące", "Po wydarzeniu", "Statystyki" + (" (admin)" if mod else "")])
+    # Jedna sekcja naraz (radio zamiast tabs) — mniej renderów = mniej „mrugania”
+    section = st.radio("Sekcja", ["Nadchodzące", "Po wydarzeniu", "Statystyki" + (" (admin)" if mod else "")], horizontal=True, label_visibility="collapsed")
 
-    # --- Nadchodzące: wybór jednego wydarzenia + zapis/wypis + lista ---
-    with tabs[0]:
+    if section.startswith("Nadchodzące"):
         df_all = cached_events_df(gid, DB_SCHEMA)
         if df_all.empty:
             st.info("Brak wydarzeń w kalendarzu")
@@ -641,8 +640,7 @@ def page_group_dashboard(group_id: int):
                 )
                 upcoming_event_view(int(pick), uid, duration_minutes)
 
-    # --- Po wydarzeniu: wybór minionego + płatności + lista z fajkami ---
-    with tabs[1]:
+    elif section.startswith("Po wydarzeniu"):
         df_all = cached_events_df(gid, DB_SCHEMA)
         if df_all.empty:
             st.info("Brak wydarzeń")
@@ -659,18 +657,15 @@ def page_group_dashboard(group_id: int):
                 )
                 past_event_view(int(pickp), uid, duration_minutes, mod, blik_phone)
 
-    # --- Statystyki + admin ---
-    with tabs[2]:
+    else:
         year = st.selectbox("Rok", options=list(range(datetime.now().year, datetime.now().year-5, -1)))
-        # proste agregaty „na szybko”: gole/asysty/win-loss licz na bazie wcześniejszej funkcji (opcjonalnie do rozbudowy)
-        st.info("Ten widok statystyk możesz rozbudować; obecnie najważniejszy flow płatności i zapisy.")
+        st.info("Widok statystyk można rozszerzać; teraz najważniejsze są płatności i zapisy.")
 
         if mod:
             st.markdown("---")
             st.subheader("Narzędzia moderatora")
             if st.button("Wygeneruj 12 kolejnych wydarzeń"):
                 upsert_events_for_group(gid, 12)
-                cache_clear()
                 st.success("Dodano brakujące wydarzenia w kalendarzu.")
 
             st.markdown("### Ustawienia grupy")
@@ -686,7 +681,6 @@ def page_group_dashboard(group_id: int):
                     else:
                         try:
                             delete_group(gid)
-                            cache_clear()
                             st.success("Grupa usunięta.")
                             st.session_state.pop("selected_group_id", None)
                             st.session_state["go_groups"] = True
