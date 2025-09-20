@@ -277,7 +277,7 @@ def upsert_events_for_group(group_id: int, weeks_ahead: int = 12):
     conn.commit(); conn.close()
 
 
-def list_groups_for_user(user_id: int) -> pd.DataFrame:(user_id: int) -> pd.DataFrame:
+def list_groups_for_user(user_id: int) -> pd.DataFrame:
     conn = get_conn()
     df = pd.read_sql_query(
         """
@@ -814,7 +814,6 @@ def page_group_dashboard(group_id: int):
                         conn.commit(); conn.close()
                         st.success("Zaktualizowano rolę")
 
-
 # ---------------------------
 # Main
 # ---------------------------
@@ -840,3 +839,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
