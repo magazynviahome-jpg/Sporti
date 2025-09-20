@@ -1,5 +1,10 @@
 # app.py — Futsal Manager (Streamlit + SQLAlchemy Core + Postgres)
-# Wersja: optymalizacje rerunów + cache + usuwanie grupy (tylko moderator)
+# Zasady:
+# - Zapisy na "Nadchodzące" bez płatności.
+# - Płatność dopiero po wydarzeniu (zakładka "Po wydarzeniu"): wyliczamy kwotę = cena / liczba zapisanych.
+# - Jeśli masz nieopłacone minione wydarzenie w grupie, blokada zapisów na przyszłe.
+# - Lista uczestników zawsze widoczna; przy płatnych ✅.
+# - Moderator = twórca grupy: może usuwać grupę i generować terminy.
 
 import os
 from datetime import datetime, date, timedelta, time as dt_time
@@ -163,6 +168,10 @@ def next_dates_for_weekday(start_from: date, weekday: int, count: int) -> List[d
     first = start_from + timedelta(days=days_ahead)
     return [first + timedelta(days=7*i) for i in range(count)]
 
+def event_is_past(starts_at: pd.Timestamp, duration_minutes: int) -> bool:
+    now = pd.Timestamp.now(tz=starts_at.tz) if hasattr(starts_at, "tz") else pd.Timestamp.now()
+    return now >= (starts_at + pd.Timedelta(minutes=duration_minutes))
+
 # ---------------------------
 # Cache helpers (redukcja zapytań / rerunów)
 # ---------------------------
@@ -190,92 +199,31 @@ def cached_get_group(group_id: int, schema: str):
         ).first()
 
 @st.cache_data(ttl=15)
-def cached_events_df(group_id: int, schema: str, only_future: bool = True) -> pd.DataFrame:
-    if engine.dialect.name == "postgresql":
-        cond = "starts_at >= NOW() - interval '1 day'"
-    else:
-        cond = "datetime(starts_at) >= datetime('now','-1 day')"
-    base = f"SELECT id, starts_at, price_cents, locked FROM {schema}.events WHERE group_id=%(gid)s"
-    if only_future:
-        base += f" AND {cond}"
-    base += " ORDER BY starts_at"
+def cached_events_df(group_id: int, schema: str) -> pd.DataFrame:
+    base = f"SELECT id, starts_at, price_cents, locked FROM {schema}.events WHERE group_id=%(gid)s ORDER BY starts_at"
     return pd.read_sql_query(base, engine, params={"gid": int(group_id)}, parse_dates=["starts_at"])
 
 @st.cache_data(ttl=20)
-def cached_list_team_members(team_id: int, schema: str) -> pd.DataFrame:
+def cached_signups_with_payments(event_id: int, schema: str) -> pd.DataFrame:
     return pd.read_sql_query(
         f"""
-        SELECT tm.user_id, u.name
-        FROM {schema}.team_members tm JOIN {schema}.users u ON u.id=tm.user_id
-        WHERE tm.team_id=%(tid)s ORDER BY u.name
+        SELECT es.user_id, u.name,
+               COALESCE(p.user_marked_paid, false) AS user_marked_paid,
+               COALESCE(p.moderator_confirmed, false) AS moderator_confirmed
+        FROM {schema}.event_signups es
+        JOIN {schema}.users u ON u.id=es.user_id
+        LEFT JOIN {schema}.payments p ON p.event_id=es.event_id AND p.user_id=es.user_id
+        WHERE es.event_id=%(eid)s
+        ORDER BY u.name
         """,
-        engine, params={"tid": int(team_id)}
+        engine, params={"eid": int(event_id)}
     )
-
-@st.cache_data(ttl=30)
-def cached_stats(group_id: int, year: int, schema: str) -> pd.DataFrame:
-    df_users = pd.read_sql_query(f"SELECT id, name FROM {schema}.users", engine)
-    if engine.dialect.name == "postgresql":
-        df_g = pd.read_sql_query(
-            f"""
-            SELECT g.event_id, g.scorer_id, g.assist_id
-            FROM {schema}.goals g JOIN {schema}.events e ON e.id=g.event_id
-            WHERE e.group_id=%(gid)s AND EXTRACT(YEAR FROM e.starts_at)=%(yr)s
-            """,
-            engine, params={"gid": int(group_id), "yr": int(year)}
-        )
-    else:
-        df_g = pd.read_sql_query(
-            f"""
-            SELECT g.event_id, g.scorer_id, g.assist_id
-            FROM {schema}.goals g JOIN {schema}.events e ON e.id=g.event_id
-            WHERE e.group_id=%(gid)s AND strftime('%Y', e.starts_at)=%(yr)s
-            """,
-            engine, params={"gid": int(group_id), "yr": f"{year:04d}"}
-        )
-
-    df_tm = pd.read_sql_query(
-        f"""
-        SELECT t.event_id, t.id AS team_id, tm.user_id, t.goals
-        FROM {schema}.teams t JOIN {schema}.team_members tm ON tm.team_id=t.id
-        WHERE t.event_id IN (SELECT id FROM {schema}.events WHERE group_id=%(gid)s)
-        """,
-        engine, params={"gid": int(group_id)}
-    )
-    df_tg = pd.read_sql_query(
-        f"SELECT event_id, MAX(goals) AS maxg FROM {schema}.teams GROUP BY event_id", engine
-    )
-
-    stats = {int(u): {"name": n, "goals": 0, "assists": 0, "wins": 0, "losses": 0, "draws": 0}
-             for u, n in (df_users.itertuples(index=False) if not df_users.empty else [])}
-
-    for _, row in (df_g.iterrows() if not df_g.empty else []):
-        if pd.notna(row["scorer_id"]):
-            stats[int(row["scorer_id"])]["goals"] += 1
-        if pd.notna(row["assist_id"]):
-            stats[int(row["assist_id"])]["assists"] += 1
-
-    if not df_tm.empty and not df_tg.empty:
-        merged = df_tm.merge(df_tg, on="event_id", how="left")
-        for _, r in merged.iterrows():
-            if pd.isna(r["maxg"]):
-                continue
-            if int(r["goals"]) == int(r["maxg"]):
-                stats[int(r["user_id"])]["wins"] += 1
-            elif int(r["goals"]) < int(r["maxg"]):
-                stats[int(r["user_id"])]["losses"] += 1
-
-    out = pd.DataFrame([{"user_id": uid, **s} for uid, s in stats.items()])
-    if out.empty:
-        return out
-    out["points"] = out["wins"]*3 + out["draws"]
-    return out.sort_values(["points","goals","assists"], ascending=False)
 
 def cache_clear():
     st.cache_data.clear()
 
 # ---------------------------
-# Logika ról
+# Logika ról i zaległości
 # ---------------------------
 
 def is_moderator(user_id: int, group_id: int) -> bool:
@@ -286,6 +234,23 @@ def is_moderator(user_id: int, group_id: int) -> bool:
                  memberships.c.role == "moderator")
         )
         return conn.execute(q).first() is not None
+
+def user_has_unpaid_past(user_id: int, group_id: int) -> bool:
+    """Czy użytkownik ma nieopłacone minione wydarzenie w tej grupie? (wg user_marked_paid=false)"""
+    with engine.begin() as conn:
+        # pobieramy wydarzenia minione z zapisami usera i sprawdzamy payments.user_marked_paid
+        sql = f"""
+        SELECT COUNT(*) AS cnt
+        FROM {DB_SCHEMA}.event_signups es
+        JOIN {DB_SCHEMA}.events e ON e.id=es.event_id
+        LEFT JOIN {DB_SCHEMA}.payments p ON p.event_id=es.event_id AND p.user_id=es.user_id
+        WHERE es.user_id=%(u)s
+          AND e.group_id=%(g)s
+          AND e.starts_at < NOW()
+          AND COALESCE(p.user_marked_paid, false) = false
+        """
+        cnt = conn.exec_driver_sql(sql, {"u": int(user_id), "g": int(group_id)}).scalar_one()
+        return int(cnt) > 0
 
 # ---------------------------
 # Auth (lightweight)
@@ -311,7 +276,7 @@ def ensure_user(name: str, phone: str = "", email: str = "") -> int:
         return uid
 
 # ---------------------------
-# Data access (mutacje)
+# Mutacje
 # ---------------------------
 
 def create_group(name: str, city: str, venue: str, weekday: int, start_time: str,
@@ -335,7 +300,6 @@ def create_group(name: str, city: str, venue: str, weekday: int, start_time: str
         return gid
 
 def delete_group(group_id: int):
-    """Usuń całą grupę (kaskadowo)."""
     with engine.begin() as conn:
         conn.exec_driver_sql(f"DELETE FROM {DB_SCHEMA}.groups WHERE id=%(g)s", {"g": int(group_id)})
 
@@ -371,11 +335,14 @@ def sign_up(event_id: int, user_id: int):
             """,
             {"e": int(event_id), "u": int(user_id), "t": now},
         )
+        # payments rekord niepotrzebny przed wydarzeniem (tworzymy po evencie, jeśli brak)
         conn.exec_driver_sql(
             f"""
             INSERT INTO {DB_SCHEMA}.payments (event_id, user_id, user_marked_paid, moderator_confirmed)
-            VALUES (%(e)s, %(u)s, false, false)
-            ON CONFLICT (event_id, user_id) DO NOTHING;
+            SELECT %(e)s, %(u)s, false, false
+            WHERE NOT EXISTS (
+               SELECT 1 FROM {DB_SCHEMA}.payments WHERE event_id=%(e)s AND user_id=%(u)s
+            );
             """,
             {"e": int(event_id), "u": int(user_id)},
         )
@@ -401,35 +368,15 @@ def payment_toggle(event_id: int, user_id: int, field: str, value: int):
         )
 
 # ---------------------------
-# Pobra­nia (bez zbędnych SELECTów)
+# Pobra­nia
 # ---------------------------
 
-def get_event_context(event_id: int):
+def get_event(event_id: int):
     with engine.begin() as conn:
-        e = conn.execute(
+        return conn.execute(
             select(events.c.id, events.c.group_id, events.c.starts_at, events.c.price_cents, events.c.locked)
             .where(events.c.id == event_id)
         ).first()
-
-        signups_df = pd.read_sql_query(
-            f"""
-            SELECT es.user_id, u.name,
-                   COALESCE(p.user_marked_paid, false) AS user_marked_paid,
-                   COALESCE(p.moderator_confirmed, false) AS moderator_confirmed
-            FROM {DB_SCHEMA}.event_signups es
-            JOIN {DB_SCHEMA}.users u ON u.id=es.user_id
-            LEFT JOIN {DB_SCHEMA}.payments p ON p.event_id=es.event_id AND p.user_id=es.user_id
-            WHERE es.event_id=%(eid)s
-            ORDER BY u.name
-            """,
-            engine, params={"eid": int(event_id)}
-        )
-
-        teams_df = pd.read_sql_query(
-            f"SELECT id, name, idx, goals FROM {DB_SCHEMA}.teams WHERE event_id=%(eid)s ORDER BY idx",
-            engine, params={"eid": int(event_id)}
-        )
-    return e, signups_df, teams_df
 
 def goals_df(event_id: int) -> pd.DataFrame:
     return pd.read_sql_query(
@@ -453,99 +400,101 @@ def total_team_goals(event_id: int) -> Tuple[int, List[int]]:
     ls = df["goals"].astype(int).tolist() if not df.empty else []
     return sum(ls), ls
 
-def set_team_goals(team_id: int, goals_value: int):
-    with engine.begin() as conn:
-        conn.execute(update(teams).where(teams.c.id == team_id).values(goals=int(goals_value)))
-
-def create_team_(event_id: int, name: str, idx: int) -> int:
-    with engine.begin() as conn:
-        return int(conn.execute(
-            insert(teams).values(event_id=int(event_id), name=name, idx=int(idx), goals=0).returning(teams.c.id)
-        ).scalar_one())
-
-def add_member_to_team(team_id: int, user_id: int):
-    with engine.begin() as conn:
-        conn.exec_driver_sql(
-            f"""
-            INSERT INTO {DB_SCHEMA}.team_members (team_id, user_id)
-            VALUES (%(t)s, %(u)s)
-            ON CONFLICT (team_id, user_id) DO NOTHING;
-            """,
-            {"t": int(team_id), "u": int(user_id)},
-        )
-
-def remove_member_from_team(team_id: int, user_id: int):
-    with engine.begin() as conn:
-        conn.exec_driver_sql(
-            f"DELETE FROM {DB_SCHEMA}.team_members WHERE team_id=%(t)s AND user_id=%(u)s",
-            {"t": int(team_id), "u": int(user_id)}
-        )
-
 # ---------------------------
 # UI helpers
 # ---------------------------
 
-def render_event_card(event_id: int):
-    e, signups_df, teams_df = get_event_context(int(event_id))
+def upcoming_event_view(event_id: int, uid: int, duration_minutes: int):
+    e = get_event(event_id)
     starts = pd.to_datetime(e.starts_at)
     gid = int(e.group_id)
-    g = cached_get_group(gid, DB_SCHEMA)
-    duration_minutes = int(g.duration_minutes if g else 60)
-    blik_phone = g.blik_phone if g else ""
-    uid = st.session_state.get("user_id")
 
-    with st.container(border=True):
-        st.subheader(starts.strftime("%d.%m.%Y %H:%M"))
-        c1, c2, c3 = st.columns([2,2,2])
+    # zaległości blokują zapisy
+    has_debt = user_has_unpaid_past(uid, gid)
 
-        # Czy zapisany?
-        is_signed = (not signups_df.empty) and (uid in set(signups_df["user_id"]))
+    signups_df = cached_signups_with_payments(event_id, DB_SCHEMA)
+    is_signed = (not signups_df.empty) and (uid in set(signups_df["user_id"]))
 
-        # Status płatności bieżącego usera — wyciągamy z signups_df (bez dodatkowego SELECT)
-        cur_row = None
-        if not signups_df.empty and uid is not None:
-            rr = signups_df[signups_df["user_id"] == uid]
-            cur_row = rr.iloc[0] if not rr.empty else None
-        cur_paid = bool(cur_row["user_marked_paid"]) if cur_row is not None else False
+    st.subheader(starts.strftime("%d.%m.%Y %H:%M") + " · Nadchodzące")
+    if has_debt:
+        st.error("Masz nieopłacone minione wydarzenie w tej grupie. Opłać je w zakładce **Po wydarzeniu**, żeby móc zapisywać się dalej.")
 
+    # działania w formie – 1 rerun
+    with st.form(f"up_ev_{event_id}", clear_on_submit=False):
+        c1, c2 = st.columns([1,3])
         if is_signed:
-            if c1.button("Wypisz się", key=f"wd_{e.id}"):
-                withdraw(e.id, uid)
-                cache_clear()
-                st.rerun()
+            can_withdraw = not has_debt  # możesz się wypisać nawet z długiem, ale zostawiamy True – logicznie tak/nie wg preferencji
+            withdraw_btn = c1.form_submit_button("Wypisz się", disabled=not can_withdraw)
+            if withdraw_btn:
+                withdraw(event_id, uid); cache_clear(); st.rerun()
         else:
-            if not cur_paid:
-                c1.info("Aby zapisać się, kliknij najpierw 'Zapłacę BLIK' i opłać udział.")
-            if cur_paid and c1.button("Zapisz się", key=f"su_{e.id}"):
-                sign_up(e.id, uid)
-                cache_clear()
-                st.rerun()
+            signup_btn = c1.form_submit_button("Zapisz się", disabled=has_debt)
+            if signup_btn:
+                sign_up(event_id, uid); cache_clear(); st.rerun()
+        st.caption("Płatność za to wydarzenie będzie dostępna po jego zakończeniu.")
 
-        with c2.expander("💳 Zapłacę BLIK"):
-            st.markdown(f"**Numer do BLIK / telefon:** {blik_phone}")
-            st.caption("Skopiuj numer, zapłać i oznacz poniżej.")
-            new_val = st.checkbox("Oznaczam: zapłacone", value=cur_paid, key=f"ump_{e.id}")
-            if bool(new_val) != bool(cur_paid):
-                payment_toggle(e.id, uid, 'user_marked_paid', int(bool(new_val)))
-                cache_clear()
-                if new_val and not is_signed:
-                    st.success("Znakomicie! Teraz możesz się zapisać na grę.")
+    st.markdown("**Uczestnicy (zapisani):**")
+    if signups_df.empty:
+        st.caption("Brak.")
+    else:
+        # Po nadchodzącym wydarzeniu nie pokazujemy płatnych fajek – tylko listę
+        st.dataframe(
+            signups_df.rename(columns={"name":"Uczestnik"})[["name"]].rename(columns={"name":"Uczestnik"}),
+            hide_index=True, use_container_width=True
+        )
 
-        count = 0 if signups_df.empty else len(signups_df)
-        per_head = int(e.price_cents) / 100 / max(1, count)
-        c3.metric("Zapisani", f"{count}")
-        c3.metric("Koszt na osobę", f"{per_head:.2f} zł")
-        if not signups_df.empty:
-            st.dataframe(
-                signups_df.rename(columns={
-                    "name":"Uczestnik",
-                    "user_marked_paid":"Zapłacone (użytkownik)",
-                    "moderator_confirmed":"Potwierdzone (mod)"
-                })[["Uczestnik","Zapłacone (użytkownik)","Potwierdzone (mod)"]],
-                hide_index=True, use_container_width=True
-            )
-        else:
-            st.caption("Brak zapisanych.")
+def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool, blik_phone: str):
+    e = get_event(event_id)
+    starts = pd.to_datetime(e.starts_at)
+    signups_df = cached_signups_with_payments(event_id, DB_SCHEMA)
+    count = 0 if signups_df.empty else len(signups_df)
+    per_head = (int(e.price_cents) / 100 / max(1, count)) if count else 0.0
+
+    st.subheader(starts.strftime("%d.%m.%Y %H:%M") + " · Po wydarzeniu")
+    st.markdown(f"**Cena hali:** {cents_to_str(int(e.price_cents))} · **Zapisanych:** {count} · **Kwota na osobę:** {per_head:.2f} zł")
+    st.markdown(f"**Numer do BLIK / telefon:** {blik_phone}")
+
+    # Własna płatność
+    my_row = None
+    if not signups_df.empty and uid in set(signups_df["user_id"]):
+        my_row = signups_df[signups_df["user_id"] == uid].iloc[0]
+        cur_paid = bool(my_row["user_marked_paid"])
+        with st.form(f"pay_me_{event_id}", clear_on_submit=False):
+            new_paid = st.checkbox("Oznaczam: zapłacone", value=cur_paid)
+            paid_btn = st.form_submit_button("Zapisz")
+            if paid_btn and bool(new_paid) != bool(cur_paid):
+                payment_toggle(event_id, uid, 'user_marked_paid', int(bool(new_paid)))
+                cache_clear(); st.rerun()
+    else:
+        st.info("Nie byłeś zapisany na to wydarzenie.")
+
+    # Lista uczestników + fajka przy opłaconych
+    st.markdown("**Uczestnicy i płatności:**")
+    if signups_df.empty:
+        st.caption("Brak.")
+    else:
+        df = signups_df.copy()
+        df["Zapłacone"] = df["user_marked_paid"].astype(bool)
+        df["Potwierdzone (mod)"] = df["moderator_confirmed"].astype(bool)
+        st.dataframe(
+            df.rename(columns={"name":"Uczestnik"})[["Uczestnik","Zapłacone","Potwierdzone (mod)"]],
+            hide_index=True, use_container_width=True
+        )
+
+    # Moderator: potwierdzenia zbiorcze
+    if is_mod and not signups_df.empty:
+        st.markdown("### Potwierdzenia moderatora")
+        for _, r in signups_df.iterrows():
+            cols = st.columns([3,2,2])
+            cols[0].markdown(f"**{r['name']}**")
+            cols[1].checkbox("Zapłacone (użytk.)", value=bool(r['user_marked_paid']), disabled=True, key=f"v_u_{event_id}_{r['user_id']}")
+            cur_conf = bool(r['moderator_confirmed'])
+            with st.form(f"mf_{event_id}_{r['user_id']}"):
+                new_conf = st.checkbox("Potwierdź (mod)", value=cur_conf, key=f"m_{event_id}_{r['user_id']}")
+                save = st.form_submit_button("Zapisz")
+                if save and bool(new_conf) != bool(cur_conf):
+                    payment_toggle(event_id, int(r['user_id']), 'moderator_confirmed', int(bool(new_conf)))
+                    cache_clear(); st.rerun()
 
 # ---------------------------
 # UI — strony
@@ -599,7 +548,7 @@ def page_groups():
         st.info("Zaloguj się z lewego panelu.")
         return
 
-    # --- Formularz tworzenia (1 submit = 1 rerun) ---
+    # --- Formularz tworzenia ---
     with st.expander("➕ Utwórz nową grupę", expanded=False):
         with st.form("create_group_form", clear_on_submit=False):
             col1, col2 = st.columns(2)
@@ -626,7 +575,6 @@ def page_groups():
                         int(weekday), start_time.strip(),
                         int(round(price * 100)), blik.strip(), int(uid), int(duration_minutes)
                     )
-                    # Generujemy serię tylko teraz (nie co render)
                     upsert_events_for_group(gid)
                     cache_clear()
                     st.session_state["selected_group_id"] = int(gid)
@@ -636,7 +584,7 @@ def page_groups():
                 except Exception as e:
                     st.error(f"Nie udało się utworzyć grupy: {e}")
 
-    # --- Lista Twoich grup (cache 30s) ---
+    # --- Lista grup ---
     try:
         df = cached_list_groups_for_user(uid, DB_SCHEMA)
     except Exception as e:
@@ -656,7 +604,6 @@ def page_groups():
             cols[3].markdown(f"Płatność BLIK: **{g['blik_phone']}**")
             if cols[4].button("Wejdź", key=f"enter_{g['id']}"):
                 st.session_state["selected_group_id"] = int(g['id'])
-                # Nic ciężkiego tutaj; ewentualne generowanie robi admin ręcznie
                 st.session_state["go_panel"] = True
                 st.rerun()
 
@@ -674,153 +621,49 @@ def page_group_dashboard(group_id: int):
     uid = int(st.session_state.get("user_id"))
     mod = is_moderator(uid, gid)
 
-    tabs = st.tabs(["Nadchodzące", "Płatności", "Drużyny & Wynik", "Statystyki" + (" (admin)" if mod else "")])
+    tabs = st.tabs(["Nadchodzące", "Po wydarzeniu", "Statystyki" + (" (admin)" if mod else "")])
 
+    # --- Nadchodzące: wybór jednego wydarzenia + zapis/wypis + lista ---
     with tabs[0]:
-        df = cached_events_df(gid, DB_SCHEMA, only_future=True)
-        if df.empty:
-            st.info("Brak nadchodzących lub bieżących wydarzeń")
+        df_all = cached_events_df(gid, DB_SCHEMA)
+        if df_all.empty:
+            st.info("Brak wydarzeń w kalendarzu")
         else:
             now = pd.Timestamp.now()
-            def is_current(row):
-                start = row["starts_at"]
-                end = start + pd.Timedelta(minutes=duration_minutes)
-                return (now >= start) and (now < end)
-            current = df[df.apply(is_current, axis=1)]
-            upcoming = df[df["starts_at"] >= now]
-
-            st.subheader("🔥 Aktualne")
-            if current.empty:
-                st.caption("Brak wydarzenia w trakcie.")
-            for _, ev in current.iterrows():
-                render_event_card(int(ev["id"]))
-
-            st.subheader("⏭️ Nadchodzące")
-            if upcoming.empty:
+            future = df_all[df_all["starts_at"] >= now]
+            if future.empty:
                 st.caption("Brak nadchodzących wydarzeń.")
-            for _, ev in upcoming.iterrows():
-                render_event_card(int(ev["id"]))
+            else:
+                pick = st.selectbox(
+                    "Wybierz termin",
+                    list(future["id"]),
+                    format_func=lambda i: pd.to_datetime(future.loc[future["id"]==i, "starts_at"].values[0]).strftime("%d.%m.%Y %H:%M")
+                )
+                upcoming_event_view(int(pick), uid, duration_minutes)
 
+    # --- Po wydarzeniu: wybór minionego + płatności + lista z fajkami ---
     with tabs[1]:
-        df_all = cached_events_df(gid, DB_SCHEMA, only_future=False)
+        df_all = cached_events_df(gid, DB_SCHEMA)
         if df_all.empty:
             st.info("Brak wydarzeń")
         else:
-            pick = st.selectbox("Wybierz wydarzenie", list(df_all["id"]),
-                                format_func=lambda i: pd.to_datetime(df_all.loc[df_all["id"]==i, "starts_at"].values[0]).strftime("%d.%m.%Y %H:%M"))
-            e, signups_df, _ = get_event_context(int(pick))
-            st.subheader("Płatności — " + pd.to_datetime(e.starts_at).strftime("%d.%m.%Y %H:%M"))
-            if mod:
-                if not signups_df.empty:
-                    for _, r in signups_df.iterrows():
-                        cols = st.columns([3,1,1,1])
-                        cols[0].markdown(f"**{r['name']}**")
-                        cols[1].checkbox("Zapłacił", value=bool(r['user_marked_paid']), key=f"u_{pick}_{r['user_id']}", disabled=True)
-                        new_conf = cols[2].checkbox("Potwierdź (mod)", value=bool(r['moderator_confirmed']), key=f"m_{pick}_{r['user_id']}")
-                        if bool(new_conf) != bool(r['moderator_confirmed']):
-                            payment_toggle(int(pick), int(r['user_id']), 'moderator_confirmed', int(bool(new_conf)))
-                            cache_clear()
-                    st.caption("Uwaga: bez potwierdzenia moderatora płatność nie jest finalna.")
-                else:
-                    st.caption("Brak zapisanych.")
+            now = pd.Timestamp.now()
+            past = df_all[df_all["starts_at"] < now]
+            if past.empty:
+                st.caption("Brak minionych wydarzeń.")
             else:
-                if not signups_df.empty:
-                    st.dataframe(
-                        signups_df.rename(columns={"name":"Uczestnik","user_marked_paid":"Zapłacone (użytkownik)","moderator_confirmed":"Potwierdzone (mod)"})[
-                            ["Uczestnik","Zapłacone (użytkownik)","Potwierdzone (mod)"]
-                        ],
-                        hide_index=True, use_container_width=True
-                    )
-                else:
-                    st.caption("Brak zapisanych.")
+                pickp = st.selectbox(
+                    "Wybierz minione wydarzenie",
+                    list(past["id"])[::-1],  # najnowsze pierwsze
+                    format_func=lambda i: pd.to_datetime(df_all.loc[df_all["id"]==i, "starts_at"].values[0]).strftime("%d.%m.%Y %H:%M")
+                )
+                past_event_view(int(pickp), uid, duration_minutes, mod, blik_phone)
 
+    # --- Statystyki + admin ---
     with tabs[2]:
-        df_all = cached_events_df(gid, DB_SCHEMA, only_future=False)
-        if df_all.empty:
-            st.info("Brak wydarzeń")
-        else:
-            pick = st.selectbox("Wydarzenie", list(df_all["id"]), key="ev_for_teams",
-                                format_func=lambda i: pd.to_datetime(df_all.loc[df_all["id"]==i, "starts_at"].values[0]).strftime("%d.%m.%Y %H:%M"))
-            e, signups_df, teams_df = get_event_context(int(pick))
-
-            if mod:
-                st.subheader("Zarządzanie drużynami (moderator)")
-                cols = st.columns(3)
-                for i in range(3):
-                    with cols[i]:
-                        label = f"Drużyna {i+1}"
-                        existing = teams_df[teams_df["idx"]==i+1]
-                        if existing.empty:
-                            if st.button(f"Dodaj {label}", key=f"add_team_{i}"):
-                                create_team_(int(pick), label, i+1)
-                                cache_clear()
-                                st.rerun()
-                        else:
-                            tid = int(existing.iloc[0]["id"])
-                            st.markdown(f"**{existing.iloc[0]['name']}**")
-                            cur_members = cached_list_team_members(tid, DB_SCHEMA)
-                            options = [] if signups_df.empty else [(int(u), n) for u, n in signups_df[["user_id","name"]].itertuples(index=False)]
-                            if options:
-                                add_choice = st.selectbox("Dodaj gracza", options=options, format_func=lambda x: x[1], key=f"sel_{tid}")
-                                if st.button("➕ Dodaj", key=f"btn_add_{tid}"):
-                                    add_member_to_team(tid, int(add_choice[0]))
-                                    cache_clear()
-                            if not cur_members.empty:
-                                rem_choice = st.selectbox("Usuń gracza", options=[(int(u), n) for u, n in cur_members.itertuples(index=False)], format_func=lambda x: x[1], key=f"rem_{tid}")
-                                if st.button("➖ Usuń", key=f"btn_rem_{tid}"):
-                                    remove_member_from_team(tid, int(rem_choice[0]))
-                                    cache_clear()
-                            goals_val = st.number_input("Gole", min_value=0, step=1, value=int(existing.iloc[0]['goals']), key=f"g_{tid}")
-                            if st.button("Zapisz gole", key=f"saveg_{tid}"):
-                                set_team_goals(tid, int(goals_val))
-                                cache_clear()
-                                st.success("Zapisano")
-
-            st.divider()
-            st.subheader("Gole i asysty (samo-raportowanie)")
-            team_map = {int(r["id"]): f"{r['name']}" for _, r in teams_df.iterrows()}
-            tchoice_keys = [None] + list(team_map.keys())
-            team_choice = st.selectbox("Drużyna (opcjonalnie)", options=tchoice_keys, format_func=lambda x: "—" if x is None else team_map[x])
-            if signups_df.empty:
-                st.info("Brak zapisanych na to wydarzenie.")
-            else:
-                scorer_choice = st.selectbox("Strzelec", options=[(int(i), n) for i,n in signups_df[["user_id","name"]].itertuples(index=False)], format_func=lambda x: x[1])
-                assist_choice = st.selectbox("Asysta (opcjonalnie)", options=[None] + [(int(i), n) for i,n in signups_df[["user_id","name"]].itertuples(index=False)], format_func=lambda x: "—" if x is None else x[1])
-                minute = st.number_input("Minuta (opcjonalnie)", min_value=0, max_value=200, step=1, value=0)
-                if st.button("Dodaj gola"):
-                    with engine.begin() as _:
-                        # prosty insert bez dodatkowych SELECTów
-                        pass
-                    # Właściwe zapisanie:
-                    from math import isnan
-                    record_goal(int(pick), int(scorer_choice[0]), int(assist_choice[0]) if assist_choice else None, int(team_choice) if team_choice else None, int(minute) if minute else None)
-                    cache_clear()
-                    st.success("Dodano gola")
-
-            st.markdown("### Lista goli")
-            gdf = goals_df(int(pick))
-            st.dataframe(gdf, hide_index=True, use_container_width=True)
-
-            total_g, team_g = total_team_goals(int(pick))
-            if len(gdf) != total_g and total_g > 0:
-                st.warning(f"Suma goli wprowadzonych ({len(gdf)}) ≠ suma bramek drużyn ({total_g}). Uzupełnij dane.")
-            elif total_g == 0:
-                st.info("Podaj gole drużyn, aby móc zweryfikować zgodność.")
-            else:
-                st.success("Liczba goli się zgadza ✅")
-
-    with tabs[3]:
         year = st.selectbox("Rok", options=list(range(datetime.now().year, datetime.now().year-5, -1)))
-        df_stats = cached_stats(gid, int(year), DB_SCHEMA)
-        if df_stats.empty:
-            st.info("Brak statystyk na wybrany rok")
-        else:
-            st.dataframe(
-                df_stats.rename(columns={"name":"Zawodnik","goals":"Gole","assists":"Asysty","wins":"Wygrane","losses":"Przegrane","draws":"Remisy","points":"Punkty"})[
-                    ["Zawodnik","Gole","Asysty","Wygrane","Przegrane","Remisy","Punkty"]
-                ],
-                hide_index=True, use_container_width=True
-            )
+        # proste agregaty „na szybko”: gole/asysty/win-loss licz na bazie wcześniejszej funkcji (opcjonalnie do rozbudowy)
+        st.info("Ten widok statystyk możesz rozbudować; obecnie najważniejszy flow płatności i zapisy.")
 
         if mod:
             st.markdown("---")
@@ -829,34 +672,6 @@ def page_group_dashboard(group_id: int):
                 upsert_events_for_group(gid, 12)
                 cache_clear()
                 st.success("Dodano brakujące wydarzenia w kalendarzu.")
-
-            st.markdown("### Zarządzanie członkami i rolami")
-            members = pd.read_sql_query(
-                f"""
-                SELECT u.id AS user_id, u.name, m.role
-                FROM {DB_SCHEMA}.memberships m JOIN {DB_SCHEMA}.users u ON u.id=m.user_id
-                WHERE m.group_id=%(gid)s
-                ORDER BY u.name
-                """,
-                engine, params={"gid": gid}
-            )
-            if members.empty:
-                st.caption("Brak członków?")
-            else:
-                for _, r in members.iterrows():
-                    cols = st.columns([3,2,2])
-                    cols[0].markdown(f"**{r['name']}**")
-                    is_mod_now = r['role'] == 'moderator'
-                    new_is_mod = cols[1].checkbox("Moderator", value=bool(is_mod_now), key=f"role_{r['user_id']}")
-                    if bool(new_is_mod) != bool(is_mod_now):
-                        with engine.begin() as conn:
-                            conn.execute(
-                                update(memberships)
-                                .where(and_(memberships.c.user_id == int(r['user_id']), memberships.c.group_id == gid))
-                                .values(role="moderator" if new_is_mod else "member")
-                            )
-                        cache_clear()
-                        st.success("Zaktualizowano rolę")
 
             st.markdown("### Ustawienia grupy")
             with st.expander("🛑 Usuń grupę (nieodwracalne)"):
@@ -880,7 +695,7 @@ def page_group_dashboard(group_id: int):
                             st.error(f"Nie udało się usunąć grupy: {e}")
 
 # ---------------------------
-# Main (ważne: przekierowania PRZED radiem)
+# Main (przekierowania PRZED radiem)
 # ---------------------------
 
 def main():
@@ -890,7 +705,7 @@ def main():
 
     sidebar_auth()
 
-    # Ustaw docelową zakładkę PRZED renderem widgetu 'radio'
+    # ustaw docelową zakładkę PRZED renderem widgetu 'radio'
     if st.session_state.get("go_panel"):
         st.session_state["go_panel"] = False
         st.session_state["nav"] = "Panel grupy"
