@@ -1,4 +1,4 @@
-# app.py — Futsal Manager (Streamlit + SQLAlchemy Core + Postgres) z kwalifikacją schematu
+# app.py — Futsal Manager (Streamlit + SQLAlchemy Core + Postgres) z kwalifikacją schematu i kasowaniem grupy
 
 import os
 from datetime import datetime, date, timedelta, time as dt_time
@@ -217,6 +217,11 @@ def create_group(name: str, city: str, venue: str, weekday: int, start_time: str
             {"u": created_by, "g": gid},
         )
         return gid
+
+def delete_group(group_id: int):
+    """Usuń całą grupę (kaskadowo)."""
+    with engine.begin() as conn:
+        conn.exec_driver_sql(f"DELETE FROM {DB_SCHEMA}.groups WHERE id=%(g)s", {"g": int(group_id)})
 
 def upsert_events_for_group(group_id: int, weeks_ahead: int = 12):
     with engine.begin() as conn:
@@ -583,7 +588,7 @@ def sidebar_auth():
     if "user_id" in st.session_state:
         st.sidebar.info(f"Zalogowano jako: {st.session_state['user_name']}")
         if st.sidebar.button("Wyloguj"):
-            for k in ["user_id","user_name","selected_group_id","selected_event_id","nav"]:
+            for k in ["user_id","user_name","selected_group_id","selected_event_id","nav","go_panel"]:
                 st.session_state.pop(k, None)
             st.rerun()
 
@@ -594,25 +599,48 @@ def page_groups():
         st.info("Zaloguj się z lewego panelu.")
         return
 
+    # --- Formularz tworzenia (bez ciągłych rerunów) ---
     with st.expander("➕ Utwórz nową grupę", expanded=False):
-        col1, col2 = st.columns(2)
-        name = col1.text_input("Nazwa grupy")
-        city = col1.text_input("Miejscowość")
-        venue = col1.text_input("Miejsce wydarzenia (hala)")
-        weekday = col2.selectbox("Dzień tygodnia", list(range(7)), format_func=lambda i: ["Pon","Wt","Śr","Czw","Pt","Sob","Nd"][i])
-        start_time = col2.text_input("Godzina startu (HH:MM)", value="21:00")
-        duration_minutes = col2.number_input("Czas gry (min)", min_value=30, max_value=240, step=15, value=60)
-        price = col2.number_input("Cena za halę (zł)", min_value=0.0, step=1.0)
-        blik = col2.text_input("Numer BLIK/telefon do płatności")
-        if st.button("Utwórz grupę"):
-            if all([name, city, venue, blik]) and ":" in start_time:
-                gid = create_group(name, city, venue, int(weekday), start_time, int(round(price*100)), blik, int(uid), int(duration_minutes))
-                upsert_events_for_group(gid)
-                st.success("Grupa utworzona. Dodano nadchodzące wydarzenia na 12 tygodni.")
-            else:
-                st.error("Uzupełnij wszystkie pola.")
+        with st.form("create_group_form", clear_on_submit=False):
+            col1, col2 = st.columns(2)
+            name = col1.text_input("Nazwa grupy")
+            city = col1.text_input("Miejscowość")
+            venue = col1.text_input("Miejsce wydarzenia (hala)")
+            weekday = col2.selectbox("Dzień tygodnia", list(range(7)),
+                                     format_func=lambda i: ["Pon","Wt","Śr","Czw","Pt","Sob","Nd"][i])
+            start_time = col2.text_input("Godzina startu (HH:MM)", value="21:00")
+            duration_minutes = col2.number_input("Czas gry (min)", min_value=30, max_value=240, step=15, value=60)
+            price = col2.number_input("Cena za halę (zł)", min_value=0.0, step=1.0)
+            blik = col2.text_input("Numer BLIK/telefon do płatności")
+            submitted = st.form_submit_button("Utwórz grupę")
 
-    df = list_groups_for_user(uid)
+        if submitted:
+            if not all([name.strip(), city.strip(), venue.strip(), blik.strip()]):
+                st.error("Uzupełnij wszystkie pola (w tym numer BLIK).")
+            elif ":" not in start_time or len(start_time) != 5:
+                st.error("Podaj godzinę w formacie HH:MM (np. 21:00).")
+            else:
+                try:
+                    gid = create_group(
+                        name.strip(), city.strip(), venue.strip(),
+                        int(weekday), start_time.strip(),
+                        int(round(price * 100)), blik.strip(), int(uid), int(duration_minutes)
+                    )
+                    upsert_events_for_group(gid)
+                    st.session_state["selected_group_id"] = int(gid)
+                    st.session_state["go_panel"] = True
+                    st.success("Grupa utworzona. Przechodzę do panelu…")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Nie udało się utworzyć grupy: {e}")
+
+    # --- Lista Twoich grup ---
+    try:
+        df = list_groups_for_user(uid)
+    except Exception as e:
+        st.error(f"Nie mogę pobrać listy grup: {e}")
+        return
+
     if df.empty:
         st.info("Nie należysz jeszcze do żadnej grupy. Utwórz grupę powyżej lub poproś moderatora o dodanie.")
         return
@@ -626,8 +654,11 @@ def page_groups():
             cols[3].markdown(f"Płatność BLIK: **{g['blik_phone']}**")
             if cols[4].button("Wejdź", key=f"enter_{g['id']}"):
                 st.session_state["selected_group_id"] = int(g['id'])
-                upsert_events_for_group(int(g['id']))
-                st.session_state["nav"] = "Panel grupy"
+                try:
+                    upsert_events_for_group(int(g['id']))
+                except Exception as e:
+                    st.warning(f"Nie udało się zaktualizować kalendarza: {e}")
+                st.session_state["go_panel"] = True
                 st.rerun()
 
 def page_group_dashboard(group_id: int):
@@ -814,6 +845,27 @@ def page_group_dashboard(group_id: int):
                             )
                         st.success("Zaktualizowano rolę")
 
+            st.markdown("### Ustawienia grupy")
+            with st.expander("🛑 Usuń grupę (nieodwracalne)"):
+                st.warning("Usunięcie grupy skasuje **wszystkie** wydarzenia, zapisy, płatności, drużyny i statystyki tej grupy. Tego nie da się cofnąć.")
+                confirm_name = st.text_input("Przepisz dokładnie nazwę grupy, aby potwierdzić:", key="del_confirm")
+                colA, colB = st.columns([1,3])
+                if colA.button("Usuń grupę", type="primary", use_container_width=True):
+                    if not mod:
+                        st.error("Tylko moderator może usunąć grupę.")
+                    elif confirm_name.strip() != name:
+                        st.error("Nazwa nie pasuje. Przepisz dokładnie nazwę grupy.")
+                    else:
+                        try:
+                            delete_group(gid)
+                            st.success("Grupa usunięta.")
+                            # wyczyść wybór i wróć do listy
+                            st.session_state.pop("selected_group_id", None)
+                            st.session_state["nav"] = "Grupy"
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Nie udało się usunąć grupy: {e}")
+
 # ---------------------------
 # Main
 # ---------------------------
@@ -826,6 +878,12 @@ def main():
     sidebar_auth()
 
     page = st.sidebar.radio("Nawigacja", ["Grupy", "Panel grupy"], key="nav", label_visibility="collapsed")
+
+    # delikatne przekierowanie – dopiero PO utworzeniu widgetów (bez konfliktu z SessionState)
+    if st.session_state.get("go_panel"):
+        st.session_state["go_panel"] = False
+        st.session_state["nav"] = "Panel grupy"
+        st.rerun()
 
     if page == "Grupy":
         page_groups()
