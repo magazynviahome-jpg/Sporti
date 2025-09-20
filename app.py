@@ -481,7 +481,7 @@ def sidebar_auth():
         if st.sidebar.button("Wyloguj"):
             for k in ["user_id","user_name","selected_group_id","selected_event_id"]:
                 st.session_state.pop(k, None)
-            st.experimental_rerun()
+            st.rerun()
 
 
 def page_groups():
@@ -525,7 +525,7 @@ def page_groups():
             if cols[4].button("Wejdź", key=f"enter_{g['id']}"):
                 st.session_state["selected_group_id"] = int(g['id'])
                 upsert_events_for_group(int(g['id']))
-                st.experimental_rerun()
+                st.rerun()
 
 
 def page_group_dashboard(group_id: int):
@@ -558,7 +558,7 @@ def page_group_dashboard(group_id: int):
                 if is_signed:
                     if c1.button("Wypisz się", key=f"wd_{e[0]}"):
                         withdraw(e[0], uid)
-                        st.experimental_rerun()
+                        st.rerun()
                 else:
                     # Business rule: pokaż możliwość zapisu dopiero po kliknięciu "Zapłacę BLIK" (user_marked_paid)
                     pay_rec = None
@@ -570,7 +570,7 @@ def page_group_dashboard(group_id: int):
                         c1.info("Aby zapisać się, kliknij najpierw 'Zapłacę BLIK' i opłać udział.")
                     if can_signup and c1.button("Zapisz się", key=f"su_{e[0]}"):
                         sign_up(e[0], uid)
-                        st.experimental_rerun()
+                        st.rerun()
 
                 # Payment box
                 with c2.expander("💳 Zapłacę BLIK"):
@@ -634,7 +634,7 @@ def page_group_dashboard(group_id: int):
                         if existing.empty:
                             if st.button(f"Dodaj {label}", key=f"add_team_{i}"):
                                 create_team(int(pick), label, i+1)
-                                st.experimental_rerun()
+                                st.rerun()
                         else:
                             tid = int(existing.iloc[0]["id"]) 
                             st.markdown(f"**{existing.iloc[0]['name']}**")
