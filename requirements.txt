@@ -1,0 +1,6 @@
+# Streamlit app dependencies
+streamlit>=1.36,<2
+pandas>=2.2,<3
+
+# (opcjonalnie) wymuś instalację NumPy zgodną z pandas
+numpy>=1.26,<3
