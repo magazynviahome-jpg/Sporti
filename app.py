@@ -35,6 +35,16 @@ def get_conn():
     return conn
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, coldef: str, default_sql: Optional[str] = None):
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in cur.fetchall()]
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}")
+        if default_sql is not None:
+            conn.execute(f"UPDATE {table} SET {column} = {default_sql} WHERE {column} IS NULL")
+        conn.commit()
+
+
 def init_db():
     # Ensure DB file exists and is writable
     db_parent = Path(DB_PATH).parent
@@ -73,6 +83,9 @@ def init_db():
         );
         """
     )
+
+    # --- Migrations for older DBs ---
+    _ensure_column(conn, 'groups', 'duration_minutes', 'INTEGER NOT NULL DEFAULT 60', default_sql='60')
 
     cur.execute(
         """
@@ -241,9 +254,6 @@ def create_group(name: str, city: str, venue: str, weekday: int, start_time: str
     conn.commit()
     conn.close()
     return gid
-
-
-def upsert_events_for_group(group_id: int, weeks_ahead: int = 12):
     """Generate weekly events if missing for the next N weeks."""
     conn = get_conn()
     g = conn.execute("SELECT weekday, start_time, price_cents FROM groups WHERE id=?", (group_id,)).fetchone()
@@ -291,6 +301,10 @@ def join_group(user_id: int, group_id: int):
 def get_group(group_id: int):
     conn = get_conn()
     row = conn.execute("SELECT id, name, city, venue, weekday, start_time, price_cents, duration_minutes, blik_phone FROM groups WHERE id=?", (group_id,)).fetchone()
+    conn.close()
+    return row
+    conn = get_conn()
+    row = conn.execute("SELECT id, name, city, venue, weekday, start_time, price_cents, blik_phone FROM groups WHERE id=?", (group_id,)).fetchone()
     conn.close()
     return row
 
@@ -534,12 +548,7 @@ def render_event_card(event_id: int):
         per_head = e[3] / 100 / max(1, count)
         c3.metric("Zapisani", f"{count}")
         c3.metric("Koszt na osobę", f"{per_head:.2f} zł")
-        st.dataframe(
-            signups.rename(columns={"name":"Uczestnik","user_marked_paid":"Zapłacone (użytkownik)","moderator_confirmed":"Potwierdzone (mod)"})[
-                ["Uczestnik","Zapłacone (użytkownik)","Potwierdzone (mod)"]
-            ],
-            hide_index=True, use_container_width=True
-        )
+        st.dataframe(signups.rename(columns={"name":"Uczestnik","user_marked_paid":"Zapłacone (użytkownik)","moderator_confirmed":"Potwierdzone (mod)"})[["Uczestnik","Zapłacone (użytkownik)","Potwierdzone (mod)"]], hide_index=True, use_container_width=True)
 
 # ---------------------------
 # UI
@@ -548,6 +557,7 @@ def render_event_card(event_id: int):
 def sidebar_auth():
     st.sidebar.header("Logowanie")
     st.sidebar.caption(f"🗄️ Baza: `{DB_PATH}`")
+    st.sidebar.header("Logowanie")
     name = st.sidebar.text_input("Imię / nick", key="login_name")
     phone = st.sidebar.text_input("Telefon (opcjonalnie)")
     email = st.sidebar.text_input("Email (opcjonalnie)")
@@ -628,7 +638,7 @@ def page_group_dashboard(group_id: int):
 
     tabs = st.tabs(["Nadchodzące", "Płatności", "Drużyny & Wynik", "Statystyki" + (" (admin)" if mod else "")])
 
-    # Nadchodzące (z podziałem na Aktualne/Nadchodzące)
+    # Nadchodzące
     with tabs[0]:
         df = events_df(gid, only_future=True)
         if df.empty:
@@ -674,12 +684,7 @@ def page_group_dashboard(group_id: int):
                         payment_toggle(int(pick), int(r['user_id']), 'moderator_confirmed', int(new_conf))
                 st.caption("Uwaga: bez potwierdzenia moderatora płatność nie jest finalna.")
             else:
-                st.dataframe(
-                    signups.rename(columns={"name":"Uczestnik","user_marked_paid":"Zapłacone (użytkownik)","moderator_confirmed":"Potwierdzone (mod)"})[
-                        ["Uczestnik","Zapłacone (użytkownik)","Potwierdzone (mod)"]
-                    ],
-                    hide_index=True, use_container_width=True
-                )
+                st.dataframe(signups.rename(columns={"name":"Uczestnik","user_marked_paid":"Zapłacone (użytkownik)","moderator_confirmed":"Potwierdzone (mod)"})[["Uczestnik","Zapłacone (użytkownik)","Potwierdzone (mod)"]], hide_index=True, use_container_width=True)
 
     # Teams & Result
     with tabs[2]:
@@ -743,19 +748,14 @@ def page_group_dashboard(group_id: int):
             else:
                 st.success("Liczba goli się zgadza ✅")
 
-    # Stats & admin
+    # Stats
     with tabs[3]:
         year = st.selectbox("Rok", options=list(range(datetime.now().year, datetime.now().year-5, -1)))
         df_stats = computed_stats(gid, int(year))
         if df_stats.empty:
             st.info("Brak statystyk na wybrany rok")
         else:
-            st.dataframe(
-                df_stats.rename(columns={"name":"Zawodnik","goals":"Gole","assists":"Asysty","wins":"Wygrane","losses":"Przegrane","draws":"Remisy","points":"Punkty"})[
-                    ["Zawodnik","Gole","Asysty","Wygrane","Przegrane","Remisy","Punkty"]
-                ],
-                hide_index=True, use_container_width=True
-            )
+            st.dataframe(df_stats.rename(columns={"name":"Zawodnik","goals":"Gole","assists":"Asysty","wins":"Wygrane","losses":"Przegrane","draws":"Remisy","points":"Punkty"})[["Zawodnik","Gole","Asysty","Wygrane","Przegrane","Remisy","Punkty"]], hide_index=True, use_container_width=True)
 
         if is_moderator(uid, gid):
             st.markdown("---")
@@ -791,30 +791,3 @@ def page_group_dashboard(group_id: int):
                         conn.execute("UPDATE memberships SET role=? WHERE user_id=? AND group_id=?", ("moderator" if new_is_mod else "member", int(r['user_id']), gid))
                         conn.commit(); conn.close()
                         st.success("Zaktualizowano rolę")
-
-
-# ---------------------------
-# Main
-# ---------------------------
-
-def main():
-    st.set_page_config(APP_TITLE, layout="wide")
-    st.title(APP_TITLE)
-    init_db()
-
-    sidebar_auth()
-
-    page = st.sidebar.radio("Nawigacja", ["Grupy", "Panel grupy"], label_visibility="collapsed")
-
-    if page == "Grupy":
-        page_groups()
-    else:
-        gid = st.session_state.get("selected_group_id")
-        if not gid:
-            st.info("Wybierz grupę z listy lub utwórz nową.")
-        else:
-            page_group_dashboard(int(gid))
-
-
-if __name__ == "__main__":
-    main()
