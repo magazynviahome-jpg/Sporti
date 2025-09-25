@@ -1,6 +1,10 @@
 # app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/SQLite)
-# Rejestracja bez telefonu; filtry na górze; sidebar: "Zalogowano jako: Nick"
-# Moderator: "Ustawienia grupy" (pełna edycja + CRUD wydarzeń)
+# Zmiany:
+# - Jedna informacja "Zalogowano jako: ..." przeniesiona na górę (header/topbar) + sync z localStorage (na zawsze)
+# - Usunięto "cap ..." z etykiet terminów (Nadchodzące/Przeszłe – listy wyboru i podglądy)
+# - W "Ustawieniach grupy" dodano sekcję: "Dodaj wiele wydarzeń w jednym dniu" (checkboxy godzin, nazwa, przycisk "Dodaj")
+# - "Nadchodzące" pokazuje WYŁĄCZNIE wydarzenia z najbliższego dnia (wszystkie sloty tego dnia, bez listy select)
+# - Reszta logiki i bezpieczeństwo jak było (hasła, płatności, statystyki)
 
 import os
 import re
@@ -16,6 +20,7 @@ from typing import List, Optional, Tuple, Dict
 
 import pandas as pd
 import streamlit as st
+from streamlit.components.v1 import html as st_html
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Integer, String,
     DateTime, Boolean, ForeignKey, UniqueConstraint, select,
@@ -170,7 +175,7 @@ users = Table(
     Column("id", Integer, primary_key=True),
     Column("name", String(255), nullable=False),
     Column("email", String(255), nullable=False),
-    Column("phone", String(64)),  # nieużywana, ale zostaje w schemacie
+    Column("phone", String(64)),
     Column("pwd_salt", String(255)),
     Column("pwd_hash", String(255)),
     Column("pwd_meta", String(255)),
@@ -327,7 +332,7 @@ def next_dates_for_weekday(start_from: date, weekday: int, count: int) -> List[d
     return [first + timedelta(days=7*i) for i in range(count)]
 
 # ---------------------------
-# E-mail (zostawiamy jak było: SSL 465 / STARTTLS 587 + timeout)
+# E-mail
 # ---------------------------
 def send_email(to_email: str, subject: str, html_body: str, text_body: Optional[str] = None):
     if not SMTP_USERNAME or not SMTP_PASSWORD:
@@ -389,7 +394,7 @@ def consume_reset_token(token: str) -> Optional[int]:
         return int(row.user_id)
 
 # ---------------------------
-# Cache helpers (SQL safe with text())
+# Cache helpers
 # ---------------------------
 @st.cache_data(ttl=30)
 def cached_list_groups_for_user(user_id: int, schema: str,
@@ -993,7 +998,11 @@ def sidebar_auth_only():
                         st.session_state["user_id"] = int(row.id)
                         st.session_state["user_name"] = row.name
                         st.session_state["user_email"] = row.email
-                        st.sidebar.success(f"Zalogowano jako: {row.name}")
+                        # zasygnalizuj sukces (bez powielania komunikatu później)
+                        st.sidebar.success("Zalogowano ✔")
+
+                        # SYNC do localStorage (na zawsze) — tylko UI nazwa (nie auth!)
+                        _inject_username_to_local_storage(row.name)
 
         with st.sidebar.expander("Nie pamiętam hasła"):
             reset_email = st.text_input("Twój e-mail", key="reset_email")
@@ -1004,12 +1013,12 @@ def sidebar_auth_only():
                     if u:
                         token = create_reset_token_for_user(int(u.id), minutes_valid=15)
                         link = f"{BASE_URL}?reset={token}"
-                        html = f"""
+                        html_body = f"""
                         <p>Cześć {u.name},</p>
                         <p>Reset hasła do Sport Manager.</p>
                         <p><a href="{link}">Kliknij, aby ustawić nowe hasło</a> (link ważny 15 minut).</p>
                         """
-                        send_email(u.email, "Reset hasła — Sport Manager", html, text_body=f"Link (15 min): {link}")
+                        send_email(u.email, "Reset hasła — Sport Manager", html_body, text_body=f"Link (15 min): {link}")
                     st.success("Jeśli adres istnieje, wysłaliśmy link resetu.")
                 except Exception as e:
                     st.error(f"Nie udało się wysłać maila: {e}")
@@ -1029,17 +1038,19 @@ def sidebar_auth_only():
                     st.session_state["user_id"] = uid
                     st.session_state["user_name"] = reg_name.strip()
                     st.session_state["user_email"] = reg_email.strip().lower()
-                    st.sidebar.success(f"Zalogowano jako: {reg_name.strip()}")
+                    st.sidebar.success("Konto utworzone i zalogowano ✔")
+                    _inject_username_to_local_storage(reg_name.strip())
                 except Exception as e:
                     st.sidebar.error(str(e))
 
     st.sidebar.markdown("---")
+    # Usuwamy powielony, stały komunikat "Zalogowano jako..." z sidebaru — info w topbar.
     if "user_id" in st.session_state:
-        st.sidebar.info(f"Zalogowano jako: {st.session_state.get('user_name','')}")
         if st.sidebar.button("Wyloguj"):
             for k in ["user_id","user_name","user_email","selected_group_id","selected_event_id","nav","go_panel","go_groups",
                       "activity_type","discipline","city_filter","postal_filter","login_attempts"]:
                 st.session_state.pop(k, None)
+            # wyczyść także UI nazwę (pozostawiamy w localStorage, ale można też skasować)
             st.rerun()
     else:
         st.sidebar.caption("Zaloguj się, aby zapisywać się i zarządzać wydarzeniami.")
@@ -1048,7 +1059,6 @@ def sidebar_auth_only():
 # Filtry (na górze strony)
 # ---------------------------
 def top_filters():
-    # wartości w state
     activity_type = st.session_state.get("activity_type", "Wszystkie")
     discipline = st.session_state.get("discipline", "Wszystkie")
     city = st.session_state.get("city_filter", "")
@@ -1061,7 +1071,7 @@ def top_filters():
         if activity_type == "Sporty drużynowe":
             discipline = c2.selectbox("Dyscyplina", ["Wszystkie"] + TEAM_SPORTS, index=(["Wszystkie"] + TEAM_SPORTS).index(discipline) if discipline in (["Wszystkie"]+TEAM_SPORTS) else 0)
         else:
-            c2.write("")  # pusty slot
+            c2.write("")
             discipline = "Wszystkie"
         city = c3.text_input("Miejscowość", value=city)
         postal = c4.text_input("Kod pocztowy", value=postal)
@@ -1075,6 +1085,7 @@ def top_filters():
 # Strony
 # ---------------------------
 def page_groups():
+    render_topbar()  # login info na samej górze
     st.header("Grupy")
 
     # Filtry u góry
@@ -1219,7 +1230,6 @@ def page_groups():
                     create_recurring_events(gid, int(weekday), int(round(price * 100)), slots, weeks_ahead=12, default_capacity=cap_val)
                     st.success("Grupa i wydarzenia utworzone.")
                     st.cache_data.clear()
-                    # Przejdź od razu do panelu nowej grupy
                     st.session_state["selected_group_id"] = int(gid)
                     st.session_state["go_panel"] = True
                     st.rerun()
@@ -1227,6 +1237,8 @@ def page_groups():
                     st.error(f"Nie udało się utworzyć grupy: {e}")
 
 def page_group_dashboard(group_id: int):
+    render_topbar()  # login info na samej górze
+
     with engine.begin() as conn:
         g = conn.execute(
             select(
@@ -1269,14 +1281,14 @@ def page_group_dashboard(group_id: int):
             if future.empty:
                 st.caption("Brak nadchodzących wydarzeń.")
             else:
-                def _fmt(i):
-                    dt = pd.to_datetime(future.loc[future["id"]==i, "starts_at"].values[0]).strftime("%d.%m.%Y %H:%M")
-                    nm = future.loc[future["id"]==i, "name"].values[0]
-                    cap = future.loc[future["id"]==i, "capacity"].values[0]
-                    cap_s = f" · cap {int(cap)}" if pd.notna(cap) and cap else ""
-                    return f"{dt} · {nm}" + cap_s if pd.notna(nm) and str(nm).strip() else dt + cap_s
-                pick = st.selectbox("Wybierz termin", list(future["id"]), format_func=_fmt)
-                upcoming_event_view(int(pick), uid, duration_minutes)
+                # Pokaż TYLKO wydarzenia z najbliższego dnia
+                future["date_only"] = future["starts_at"].dt.date
+                nearest_date = min(future["date_only"])
+                day_events = future[future["date_only"] == nearest_date].sort_values("starts_at")
+
+                st.subheader(f"Najbliższy dzień: {pd.to_datetime(nearest_date).strftime('%d.%m.%Y')}")
+                for row in day_events.itertuples():
+                    upcoming_event_view(int(row.id), uid, duration_minutes)
 
     elif section == "Przeszłe":
         df_all = cached_events_df(gid, DB_SCHEMA)
@@ -1288,12 +1300,11 @@ def page_group_dashboard(group_id: int):
             if past.empty:
                 st.caption("Brak przeszłych wydarzeń.")
             else:
+                # Selectbox bez "cap ..." w etykiecie
                 def _fmtp(i):
                     dt = pd.to_datetime(df_all.loc[df_all["id"]==i, "starts_at"].values[0]).strftime("%d.%m.%Y %H:%M")
                     nm = df_all.loc[df_all["id"]==i, "name"].values[0]
-                    cap = df_all.loc[df_all["id"]==i, "capacity"].values[0]
-                    cap_s = f" · cap {int(cap)}" if pd.notna(cap) and cap else ""
-                    return f"{dt} · {nm}" + cap_s if pd.notna(nm) and str(nm).strip() else dt + cap_s
+                    return f"{dt} · {nm}" if pd.notna(nm) and str(nm).strip() else dt
                 pickp = st.selectbox("Wybierz wydarzenie", list(past["id"])[::-1], format_func=_fmtp)
                 past_event_view(int(pickp), uid, duration_minutes, mod, blik_phone)
 
@@ -1374,6 +1385,50 @@ def page_group_dashboard(group_id: int):
                 st.error(f"Nie udało się dodać wydarzenia: {e}")
 
         st.markdown("---")
+        # NOWA SEKCJA: wiele wydarzeń w jednym dniu (checkboxy godzin)
+        st.subheader("Dodaj wiele wydarzeń w jednym dniu")
+        with st.form("add_multi_events"):
+            c1, c2 = st.columns([1,2])
+            mass_date = c1.date_input("Data", value=pd.Timestamp.now().date(), key="multi_date")
+            ev_mass_name = c2.text_input("Nazwa (wspólna dla slotów — opcjonalnie)", key="multi_name", placeholder="np. Trening / Sparing")
+            st.caption("Wybierz godziny (checkboxy):")
+            # siatka checkboxów 24h
+            hours = [f"{h:02d}:00" for h in range(24)]
+            selected_hours: List[str] = []
+            grid_cols = st.columns(6)
+            for idx, hh in enumerate(hours):
+                col = grid_cols[idx % 6]
+                if col.checkbox(hh, key=f"chk_{hh}"):
+                    selected_hours.append(hh)
+            c3, c4 = st.columns([1,3])
+            price_mass = c3.number_input("Cena (zł)", min_value=0.0, step=1.0, value=price_cents/100, key="multi_price")
+            cap_mass = c4.number_input("Limit miejsc (0 = bez limitu)", min_value=0, step=1, value=int(default_capacity or 0), key="multi_cap")
+            add_multi_btn = st.form_submit_button("Dodaj wybrane")
+        if add_multi_btn:
+            if not selected_hours:
+                st.warning("Zaznacz przynajmniej jedną godzinę.")
+            else:
+                try:
+                    with engine.begin() as conn:
+                        for hhmm in sorted(set(selected_hours)):
+                            h, m = map(int, hhmm.split(":"))
+                            starts_at = datetime.combine(mass_date, dt_time(hour=h, minute=m))
+                            conn.execute(
+                                insert(events).values(
+                                    group_id=gid,
+                                    starts_at=starts_at,
+                                    price_cents=int(round(price_mass*100)),
+                                    capacity=(int(cap_mass) if cap_mass>0 else None),
+                                    generated=False,
+                                    name=(ev_mass_name.strip() or None)
+                                )
+                            )
+                    st.success(f"Dodano {len(set(selected_hours))} wydarzeń w dniu {mass_date.strftime('%d.%m.%Y')}.")
+                    st.cache_data.clear()
+                except Exception as e:
+                    st.error(f"Nie udało się dodać wielu wydarzeń: {e}")
+
+        st.markdown("---")
         st.subheader("Lista wydarzeń (edycja / usuwanie)")
         df_all = cached_events_df(gid, DB_SCHEMA)
         if df_all.empty:
@@ -1383,6 +1438,7 @@ def page_group_dashboard(group_id: int):
                 with st.container(border=True):
                     cols = st.columns([2.2, 1.3, 1.3, 1, 0.8, 0.8])
                     dt_old = pd.to_datetime(row.starts_at)
+                    # Bez "cap ..." w nazwie bloku (zostawiamy osobne pole z pojemnością)
                     cols[0].markdown(f"**{dt_old.strftime('%d.%m.%Y %H:%M')}**" + (f" · {row.name}" if pd.notna(row.name) and str(row.name).strip() else ""))
                     with cols[1].form(f"edit_ev_{row.id}", clear_on_submit=False):
                         new_date = st.date_input("Data", value=dt_old.date(), key=f"d_{row.id}")
@@ -1395,7 +1451,8 @@ def page_group_dashboard(group_id: int):
                     del_btn = cols[3].button("Usuń", key=f"del_{row.id}")
                     gen_lbl = "autogen" if row.generated else "ręczne"
                     cols[4].caption(gen_lbl)
-                    cols[5].caption(f"cap: {int(row.capacity) if row.capacity else '—'}")
+                    # usuwamy podpis "cap: X" z końca — zostaje tylko edytowalne pole w formularzu
+                    cols[5].caption(f"{'limit' if row.capacity else '—'}")
 
                     if save:
                         try:
@@ -1458,6 +1515,80 @@ def page_group_dashboard(group_id: int):
         st.info("Tu później ranking i wykresy. Teraz priorytet: zapisy, płatności, gole/asysty.")
 
 # ---------------------------
+# TOPBAR + localStorage (na zawsze)
+# ---------------------------
+def _inject_username_to_local_storage(name: str):
+    """Zapisuje nazwę do localStorage po stronie przeglądarki (UI only)."""
+    safe_name = (name or "").replace("\\", "\\\\").replace("`", "\\`")
+    st_html(
+        f"""
+        <script>
+        try {{
+          localStorage.setItem("ui.username", JSON.stringify("{safe_name}"));
+          window.dispatchEvent(new StorageEvent('storage', {{
+            key: 'ui.username', newValue: JSON.stringify("{safe_name}")
+          }}));
+        }} catch (e) {{}}
+        </script>
+        """,
+        height=0,
+    )
+
+def render_topbar():
+    """Renderuje górny pasek z informacją o zalogowanym użytkowniku.
+       Priorytet: session_state, a następnie localStorage (na zawsze)."""
+    st.markdown(
+        """
+        <style>
+        .topbar-user {
+            padding: .5rem .75rem;
+            background: #f6f6ff;
+            border: 1px solid #e3e3ff;
+            border-radius: .5rem;
+            font-weight: 600;
+            display: inline-block;
+            margin-bottom: .5rem;
+        }
+        </style>
+        <div id="login-banner" class="topbar-user">Sprawdzam stan logowania…</div>
+        """,
+        unsafe_allow_html=True
+    )
+    # Ustal treść z session_state i z localStorage
+    ss_name = st.session_state.get("user_name", "")
+    ss_text = f"Zalogowano jako: {ss_name}" if ss_name else "Niezalogowany"
+
+    st_html(
+        f"""
+        <script>
+        (function() {{
+          const el = window.parent.document.getElementById("login-banner") || document.getElementById("login-banner");
+          function setText(t) {{ if (el) el.textContent = t; }}
+          // SessionState (z backendu) — wstawiamy od razu
+          setText("{ss_text}".replaceAll("&amp;","&"));
+          // localStorage fallback/persist
+          try {{
+            const v = JSON.parse(localStorage.getItem("ui.username") || "null");
+            if (v && !"{ss_name}".trim()) {{
+               setText("Zalogowano jako: " + v);
+            }}
+          }} catch(e) {{}}
+          // Nasłuch aktualizacji (np. po logowaniu)
+          window.addEventListener("storage", (e) => {{
+            if (e.key === "ui.username" && e.newValue) {{
+              try {{
+                const name = JSON.parse(e.newValue);
+                setText("Zalogowano jako: " + name);
+              }} catch(_) {{}}
+            }}
+          }});
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+# ---------------------------
 # Main
 # ---------------------------
 def main():
@@ -1471,7 +1602,7 @@ def main():
         st.session_state["go_groups"] = False
         st.session_state["nav"] = "Grupy"
 
-    # Sidebar tylko do auth + status (bez napisu "Panel")
+    # Sidebar tylko auth (bez stałego "Zalogowano jako ...")
     sidebar_auth_only()
 
     page = st.sidebar.radio("Nawigacja", ["Grupy", "Panel grupy"], key="nav", label_visibility="collapsed")
@@ -1481,6 +1612,7 @@ def main():
     else:
         gid = st.session_state.get("selected_group_id")
         if not gid:
+            render_topbar()
             st.info("Wybierz grupę z listy (Grupy) lub dołącz do jednej.")
             return
         page_group_dashboard(int(gid))
