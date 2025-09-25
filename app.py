@@ -1,11 +1,15 @@
-# app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/Neon)
-# Nowości:
-# - Przy tworzeniu grupy możesz dodać wiele zajęć w tym samym dniu (format: "HH:MM;Nazwa")
-# - Aplikacja generuje 12 tygodni wydarzeń dla KAŻDEGO slotu (czas + nazwa)
-# - events.name (nazwa zajęć) — pokazywana przy wyborze wydarzenia
-# Pozostałe funkcje: logowanie telefonem, filtry, zapisy/płatności, gole/asysty, usuwanie grupy
+# app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/Neon/Railway)
+# Kluczowe funkcje:
+# - Logowanie/rejestracja: WYMAGANY telefon jako „hasło” (twarda walidacja formatu)
+# - Filtry: typ aktywności, dyscyplina/fitness, miejscowość, kod pocztowy
+# - Grupy widoczne dla wszystkich, dołączanie, panel grupy
+# - Wydarzenia: generowanie 12 tygodni; wiele slotów w tym samym dniu (HH:MM;Nazwa)
+# - Zapisy, płatność po meczu; blokada zapisów przy zaległościach
+# - Gole/asysty, edycja (uczestnik swoje, moderator dowolne)
+# - Moderator: generowanie wydarzeń, usuwanie grupy
 
 import os
+import re
 from datetime import datetime, date, timedelta, time as dt_time
 from typing import List, Optional, Tuple
 
@@ -82,6 +86,16 @@ ALL_DISCIPLINES = TEAM_SPORTS + FITNESS_CLASSES
 
 def is_team_sport(sport_name: str) -> bool:
     return sport_name in TEAM_SPORTS
+
+# ---------------------------
+# Walidacja telefonu
+# ---------------------------
+def validate_phone(phone: str) -> bool:
+    """Akceptujemy numery 9–15 cyfr, opcjonalnie z + na początku; spacje i myślniki ignorowane."""
+    if not phone:
+        return False
+    p = phone.strip().replace(" ", "").replace("-", "")
+    return bool(re.fullmatch(r"\+?\d{9,15}", p))
 
 # ---------------------------
 # Tabele
@@ -375,20 +389,26 @@ def user_has_unpaid_past(user_id: int, group_id: int) -> bool:
 # Mutacje
 # ---------------------------
 def ensure_user(name: str, phone: str = "") -> int:
+    # twardy wymóg telefonu (formatowanie i normalizacja)
+    if not validate_phone(phone):
+        raise ValueError("Telefon jest wymagany i musi mieć prawidłowy format (+ i 9–15 cyfr).")
+    norm_phone = phone.strip().replace(" ", "").replace("-", "")
+
     with engine.begin() as conn:
-        q = select(users.c.id).where(
-            and_(users.c.name == name, func.coalesce(users.c.phone, "") == (phone or ""))
-        )
-        row = conn.execute(q).first()
+        row = conn.execute(
+            select(users.c.id, users.c.phone).where(users.c.name == name)
+        ).first()
+
         if row:
-            uid = int(row.id)
-            if phone:
-                conn.execute(update(users).where(users.c.id == uid).values(phone=phone))
+            # jeżeli istnieje użytkownik o tej nazwie, telefon MUSI pasować
+            if (row.phone or "") != norm_phone:
+                raise ValueError("Użytkownik o tej nazwie istnieje z innym numerem telefonu.")
+            return int(row.id)
         else:
             uid = int(conn.execute(
-                insert(users).values(name=name, phone=phone or None).returning(users.c.id)
+                insert(users).values(name=name, phone=norm_phone).returning(users.c.id)
             ).scalar_one())
-        return uid
+            return uid
 
 def join_group(user_id: int, group_id: int):
     with engine.begin() as conn:
@@ -700,7 +720,7 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
         st.markdown("**Uczestnicy · płatności + statystyki w tym meczu:**")
         participants_table(int(e.group_id), event_id, show_pay=True)
 
-        # ---- Gole / Asysty (tylko dla sportów drużynowych sensownie, ale pozostawiamy opcję edycji) ----
+        # ---- Gole / Asysty ----
         st.markdown("---")
         st.subheader("Gole i asysty (edytuj / dodaj)")
 
@@ -718,7 +738,6 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
         if 'add_btn' in locals() and add_btn:
             scorer_id = int(scorer[1])
             assist_id = None if (assist[1] is None) else int(assist[1])
-            # uprawnienia: własny gol lub moderator
             if is_mod or scorer_id == uid:
                 add_goal(event_id, scorer_id, assist_id, int(minute))
                 st.success("Dodano gola.")
@@ -782,30 +801,40 @@ def sidebar_auth_and_filters():
 
     # Logowanie / rejestracja — telefon wymagany (działa jako "hasło")
     name = st.sidebar.text_input("Imię / nick")
-    phone = st.sidebar.text_input("Telefon (wymagany, działa jako hasło)")
+    phone_raw = st.sidebar.text_input("Telefon (wymagany, działa jako hasło)")
+
     login = st.sidebar.button("Zaloguj / Rejestruj")
 
     if login:
-        if not name.strip() or not phone.strip():
+        if not name.strip() or not phone_raw.strip():
             st.sidebar.error("Podaj imię i telefon.")
+        elif not validate_phone(phone_raw):
+            st.sidebar.error("Telefon w nieprawidłowym formacie (dozwolone: + i 9–15 cyfr).")
         else:
-            # sprawdź, czy user istnieje – jeśli tak, weryfikuj telefon
+            phone = phone_raw.strip().replace(" ", "").replace("-", "")
+            # sprawdź czy istnieje user o takim imieniu
             with engine.begin() as conn:
                 row = conn.execute(
                     select(users.c.id, users.c.phone).where(users.c.name == name.strip())
                 ).first()
+
             if row:
-                if (row.phone or "") != phone.strip():
+                # LOGIN: telefon MUSI pasować
+                if (row.phone or "") != phone:
                     st.sidebar.error("Błędny telefon dla tego użytkownika.")
                 else:
                     st.session_state["user_id"] = int(row.id)
                     st.session_state["user_name"] = name.strip()
                     st.sidebar.success(f"Witaj, {name.strip()}!")
             else:
-                uid = ensure_user(name.strip(), phone.strip())
-                st.session_state["user_id"] = uid
-                st.session_state["user_name"] = name.strip()
-                st.sidebar.success(f"Utworzono konto. Witaj, {name.strip()}!")
+                # REJESTRACJA: telefon jest "hasłem" i musi być zapisany
+                try:
+                    uid = ensure_user(name.strip(), phone)
+                    st.session_state["user_id"] = uid
+                    st.session_state["user_name"] = name.strip()
+                    st.sidebar.success(f"Utworzono konto. Witaj, {name.strip()}!")
+                except Exception as e:
+                    st.sidebar.error(str(e))
 
     st.sidebar.markdown("---")
 
@@ -953,8 +982,7 @@ def page_groups():
             else:
                 # parse extra slots
                 slots: List[Tuple[str, Optional[str]]] = []
-                # bazowy slot (bez nazwy)
-                slots.append((start_time.strip(), None))
+                slots.append((start_time.strip(), None))  # bazowy slot
                 if extra_raw.strip():
                     for line in extra_raw.strip().splitlines():
                         if ";" in line:
@@ -964,7 +992,6 @@ def page_groups():
                             if len(hhmm) == 5 and ":" in hhmm and nm:
                                 slots.append((hhmm, nm))
                         else:
-                            # pozwól też na samą godzinę bez nazwy (rzadki przypadek)
                             hhmm = line.strip()
                             if len(hhmm) == 5 and ":" in hhmm:
                                 slots.append((hhmm, None))
@@ -1095,8 +1122,8 @@ def main():
         gid = st.session_state.get("selected_group_id")
         if not gid:
             st.info("Wybierz grupę z listy (Grupy) lub dołącz do jednej.")
-        else:
-            page_group_dashboard(int(gid))
+            return
+        page_group_dashboard(int(gid))
 
 if __name__ == "__main__":
     main()
