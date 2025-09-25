@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Integer, String,
-    DateTime, Boolean, ForeignKey, UniqueConstraint, select, func,
+    DateTime, Boolean, ForeignKey, UniqueConstraint, select,
     insert, update, and_, text
 )
 from sqlalchemy.engine import Engine
@@ -229,18 +229,18 @@ goals = Table(
 def init_db():
     metadata.create_all(engine)
     with engine.begin() as conn:
-        conn.exec_driver_sql(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 60;")
-        conn.exec_driver_sql(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS blik_phone TEXT NOT NULL DEFAULT '';")
-        conn.exec_driver_sql(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS sport TEXT NOT NULL DEFAULT 'Piłka nożna (Hala)';")
-        conn.exec_driver_sql(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS postal_code TEXT;")
-        conn.exec_driver_sql(f"ALTER TABLE {T('memberships')} ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'member';")
-        conn.exec_driver_sql(f"ALTER TABLE {T('events')} ADD COLUMN IF NOT EXISTS name TEXT;")
+        conn.execute(text(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 60;"))
+        conn.execute(text(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS blik_phone TEXT NOT NULL DEFAULT '';"))
+        conn.execute(text(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS sport TEXT NOT NULL DEFAULT 'Piłka nożna (Hala)';"))
+        conn.execute(text(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS postal_code TEXT;"))
+        conn.execute(text(f"ALTER TABLE {T('memberships')} ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'member';"))
+        conn.execute(text(f"ALTER TABLE {T('events')} ADD COLUMN IF NOT EXISTS name TEXT;"))
 
-        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_events_group_starts ON {T('events')} (group_id, starts_at);")
-        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_signups_event ON {T('event_signups')} (event_id);")
-        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_payments_event_user ON {T('payments')} (event_id, user_id);")
-        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_goals_event_scorer ON {T('goals')} (event_id, scorer_id);")
-        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_goals_event_assist ON {T('goals')} (event_id, assist_id);")
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_events_group_starts ON {T('events')} (group_id, starts_at);"))
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_signups_event ON {T('event_signups')} (event_id);"))
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_payments_event_user ON {T('payments')} (event_id, user_id);"))
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_goals_event_scorer ON {T('goals')} (event_id, scorer_id);"))
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_goals_event_assist ON {T('goals')} (event_id, assist_id);"))
 
 # ---------------------------
 # Utils
@@ -298,7 +298,7 @@ def cached_list_groups_for_user(user_id: int, schema: str,
         params["pc"] = f"%{postal_filter.lower()}%"
 
     sql += " ORDER BY g.city, g.name"
-    return pd.read_sql_query(sql, engine, params=params)
+    return pd.read_sql_query(text(sql), engine, params=params)
 
 @st.cache_data(ttl=30)
 def cached_all_groups(uid: int, schema: str,
@@ -340,29 +340,31 @@ def cached_all_groups(uid: int, schema: str,
         params["pc"] = f"%{postal_filter.lower()}%"
 
     sql += " ORDER BY g.city, g.name"
-    return pd.read_sql_query(sql, engine, params=params)
+    return pd.read_sql_query(text(sql), engine, params=params)
 
 @st.cache_data(ttl=20)
 def cached_events_df(group_id: int, schema: str) -> pd.DataFrame:
     base = f"SELECT id, starts_at, price_cents, locked, name FROM {T('events')} WHERE group_id=:gid ORDER BY starts_at"
-    return pd.read_sql_query(base, engine, params={"gid": int(group_id)}, parse_dates=["starts_at"])
+    return pd.read_sql_query(text(base), engine, params={"gid": int(group_id)}, parse_dates=["starts_at"])
 
 @st.cache_data(ttl=20)
 def cached_signups(event_id: int, schema: str) -> pd.DataFrame:
     return pd.read_sql_query(
+        text(
         f"""
         SELECT es.user_id, u.name
         FROM {T('event_signups')} es
         JOIN {T('users')} u ON u.id=es.user_id
         WHERE es.event_id=:eid
         ORDER BY u.name
-        """,
+        """),
         engine, params={"eid": int(event_id)}
     )
 
 @st.cache_data(ttl=20)
 def cached_signups_with_payments(event_id: int, schema: str) -> pd.DataFrame:
     return pd.read_sql_query(
+        text(
         f"""
         SELECT es.user_id, u.name,
                COALESCE(p.user_marked_paid, 0) AS user_marked_paid,
@@ -372,13 +374,14 @@ def cached_signups_with_payments(event_id: int, schema: str) -> pd.DataFrame:
         LEFT JOIN {T('payments')} p ON p.event_id=es.event_id AND p.user_id=es.user_id
         WHERE es.event_id=:eid
         ORDER BY u.name
-        """,
+        """),
         engine, params={"eid": int(event_id)}
     )
 
 @st.cache_data(ttl=20)
 def cached_event_goals(event_id: int, schema: str) -> pd.DataFrame:
     return pd.read_sql_query(
+        text(
         f"""
         SELECT g.id, g.event_id, g.scorer_id, s.name AS scorer_name,
                g.assist_id, a.name AS assist_name,
@@ -388,7 +391,7 @@ def cached_event_goals(event_id: int, schema: str) -> pd.DataFrame:
         LEFT JOIN {T('users')} a ON a.id=g.assist_id
         WHERE g.event_id=:eid
         ORDER BY COALESCE(g.minute,9999), g.id
-        """,
+        """),
         engine, params={"eid": int(event_id)}
     )
 
@@ -418,7 +421,7 @@ def user_has_unpaid_past(user_id: int, group_id: int) -> bool:
             AND COALESCE(p.user_marked_paid, 0) = 0
         ) AS has_debt
         """
-        return bool(conn.exec_driver_sql(sql, {"u": int(user_id), "g": int(group_id)}).scalar_one())
+        return bool(conn.execute(text(sql), {"u": int(user_id), "g": int(group_id)}).scalar_one())
 
 # ---------------------------
 # Mutacje
@@ -447,20 +450,22 @@ def ensure_user(name: str, phone: str = "") -> int:
 
 def _insert_membership(conn, user_id: int, group_id: int, role: str):
     if IS_PG:
-        conn.exec_driver_sql(
+        conn.execute(
+            text(
             f"""
             INSERT INTO {T('memberships')} (user_id, group_id, role)
             VALUES (:u, :g, :r)
             ON CONFLICT (user_id, group_id) DO NOTHING;
-            """,
+            """),
             {"u": int(user_id), "g": int(group_id), "r": role},
         )
     else:
-        conn.exec_driver_sql(
+        conn.execute(
+            text(
             f"""
             INSERT OR IGNORE INTO {T('memberships')} (user_id, group_id, role)
             VALUES (:u, :g, :r);
-            """,
+            """),
             {"u": int(user_id), "g": int(group_id), "r": role},
         )
 
@@ -485,7 +490,7 @@ def create_group(name: str, city: str, venue: str, weekday: int, start_time: str
 
 def delete_group(group_id: int):
     with engine.begin() as conn:
-        conn.exec_driver_sql(f"DELETE FROM {T('groups')} WHERE id=:g", {"g": int(group_id)})
+        conn.execute(text(f"DELETE FROM {T('groups')} WHERE id=:g"), {"g": int(group_id)})
 
 def create_recurring_events(group_id: int, weekday: int, base_price_cents: int,
                             slots: List[Tuple[str, Optional[str]]], weeks_ahead: int = 12):
@@ -527,65 +532,63 @@ def sign_up(event_id: int, user_id: int):
     with engine.begin() as conn:
         # zapisy
         if IS_PG:
-            conn.exec_driver_sql(
+            conn.execute(
+                text(
                 f"""
                 INSERT INTO {T('event_signups')} (event_id, user_id, signed_at)
                 VALUES (:e, :u, :t)
                 ON CONFLICT (event_id, user_id) DO NOTHING;
-                """,
+                """),
                 {"e": int(event_id), "u": int(user_id), "t": now},
             )
         else:
-            conn.exec_driver_sql(
+            conn.execute(
+                text(
                 f"""
                 INSERT OR IGNORE INTO {T('event_signups')} (event_id, user_id, signed_at)
                 VALUES (:e, :u, :t);
-                """,
+                """),
                 {"e": int(event_id), "u": int(user_id), "t": now},
             )
 
         # płatność (upewnij się, że rekord istnieje)
-        conn.exec_driver_sql(
+        conn.execute(
+            text(
             f"""
             INSERT INTO {T('payments')} (event_id, user_id, user_marked_paid, moderator_confirmed)
             SELECT :e, :u, 0, 0
             WHERE NOT EXISTS (
                SELECT 1 FROM {T('payments')} WHERE event_id=:e AND user_id=:u
             );
-            """,
+            """),
             {"e": int(event_id), "u": int(user_id)},
         )
 
         # członkostwo w grupie
-        conn.exec_driver_sql(
+        conn.execute(
+            text(
             f"""
             INSERT OR IGNORE INTO {T('memberships')} (user_id, group_id, role)
             SELECT :u, e.group_id, 'member'
             FROM {T('events')} e
             WHERE e.id=:e;
-            """,
+            """),
             {"u": int(user_id), "e": int(event_id)},
         )
 
 def withdraw(event_id: int, user_id: int):
     with engine.begin() as conn:
-        conn.exec_driver_sql(
-            f"DELETE FROM {T('payments')} WHERE event_id=:e AND user_id=:u",
-            {"e": int(event_id), "u": int(user_id)}
-        )
-        conn.exec_driver_sql(
-            f"DELETE FROM {T('event_signups')} WHERE event_id=:e AND user_id=:u",
-            {"e": int(event_id), "u": int(user_id)}
-        )
+        conn.execute(text(f"DELETE FROM {T('payments')} WHERE event_id=:e AND user_id=:u"),
+                     {"e": int(event_id), "u": int(user_id)})
+        conn.execute(text(f"DELETE FROM {T('event_signups')} WHERE event_id=:e AND user_id=:u"),
+                     {"e": int(event_id), "u": int(user_id)})
 
 def payment_toggle(event_id: int, user_id: int, field: str, value: int):
     if field not in ("user_marked_paid", "moderator_confirmed"):
         return
     with engine.begin() as conn:
-        conn.exec_driver_sql(
-            f"UPDATE {T('payments')} SET {field}=:v WHERE event_id=:e AND user_id=:u",
-            {"v": bool(value), "e": int(event_id), "u": int(user_id)},
-        )
+        conn.execute(text(f"UPDATE {T('payments')} SET {field}=:v WHERE event_id=:e AND user_id=:u"),
+                     {"v": bool(value), "e": int(event_id), "u": int(user_id)})
 
 # ---- Goals CRUD ----
 def add_goal(event_id: int, scorer_id: int, assist_id: Optional[int], minute: Optional[int]):
@@ -612,7 +615,7 @@ def delete_goal(goal_id: int, editor_uid: int, is_mod: bool):
             return
         if (not is_mod) and int(owner) != int(editor_uid):
             return
-        conn.exec_driver_sql(f"DELETE FROM {T('goals')} WHERE id=:g", {"g": int(goal_id)})
+        conn.execute(text(f"DELETE FROM {T('goals')} WHERE id=:g"), {"g": int(goal_id)})
 
 # ---------------------------
 # UI helpers
@@ -632,6 +635,7 @@ def participants_table(group_id: int, event_id: int, show_pay=False):
 
     if show_pay:
         df = pd.read_sql_query(
+            text(
             f"""
             SELECT es.user_id, u.name,
                    COALESCE(p.user_marked_paid, 0) AS user_marked_paid,
@@ -645,7 +649,7 @@ def participants_table(group_id: int, event_id: int, show_pay=False):
             WHERE es.event_id=:eid
             GROUP BY es.user_id,u.name,p.user_marked_paid,p.moderator_confirmed
             ORDER BY user_marked_paid DESC, u.name
-            """,
+            """),
             engine, params={"eid": int(event_id)}
         )
     else:
@@ -685,7 +689,7 @@ def participants_table(group_id: int, event_id: int, show_pay=False):
               AND CAST(strftime('%Y', e.starts_at) AS INTEGER)=:yr
             GROUP BY u.id, u.name
             """
-        stats = pd.read_sql_query(stats_sql, engine, params={"gid": int(e.group_id), "yr": int(year)})
+        stats = pd.read_sql_query(text(stats_sql), engine, params={"gid": int(e.group_id), "yr": int(year)})
 
         df = signups_df.merge(stats, on="user_id", how="left", suffixes=("", "_stat"))
         if "name" not in df.columns and "name_stat" in df.columns:
@@ -718,6 +722,13 @@ def participants_table(group_id: int, event_id: int, show_pay=False):
 # ---------------------------
 # Widoki wydarzeń
 # ---------------------------
+def get_event(event_id: int):
+    with engine.begin() as conn:
+        return conn.execute(
+            select(events.c.id, events.c.group_id, events.c.starts_at, events.c.price_cents, events.c.locked, events.c.name)
+            .where(events.c.id == event_id)
+        ).first()
+
 def upcoming_event_view(event_id: int, uid: int, duration_minutes: int):
     e = get_event(event_id)
     starts = pd.to_datetime(e.starts_at)
@@ -823,15 +834,14 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
                     cols[0].markdown(f"**Gol #{row.id}** — {row.scorer_name or '—'} (asysta: {row.assist_name or '—'})")
                     with cols[1].form(f"edit_goal_{row.id}", clear_on_submit=False):
                         # strzelec
-                        user_options_sorted = user_options
                         sc_idx = 0
-                        for i, (_, u) in enumerate(user_options_sorted):
+                        for i, (_, u) in enumerate(user_options):
                             if u == row.scorer_id:
                                 sc_idx = i
                                 break
-                        sc_sel = st.selectbox("Strzelec", user_options_sorted, index=sc_idx, key=f"edit_sc_{row.id}")
+                        sc_sel = st.selectbox("Strzelec", user_options, index=sc_idx, key=f"edit_sc_{row.id}")
                         # asysta
-                        as_opts = [("— brak —", None)] + user_options_sorted
+                        as_opts = [("— brak —", None)] + user_options
                         as_idx = 0
                         for i,(label,uidx) in enumerate(as_opts):
                             if uidx == row.assist_id:
@@ -880,7 +890,7 @@ def sidebar_auth_and_filters():
             st.sidebar.error("Telefon w nieprawidłowym formacie (dozwolone: + i 9–15 cyfr).")
         else:
             phone = phone_raw.strip().replace(" ", "").replace("-", "")
-            # sprawdź czy istnieje user o tej nazwie
+            # sprawdź czy istnieje user o tej naz wie
             with engine.begin() as conn:
                 row = conn.execute(
                     select(users.c.id, users.c.phone).where(users.c.name == name.strip())
