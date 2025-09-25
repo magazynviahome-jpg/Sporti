@@ -56,7 +56,7 @@ DIALECT = engine.dialect.name
 IS_PG = DIALECT == "postgresql"
 
 def T(table_name: str) -> str:
-    """Zwraca w pełni kwalifikowaną nazwę tabeli do surowych SQL-i."""
+    """W pełni kwalifikowana nazwa tabeli do surowych SQL-i."""
     return f"{DB_SCHEMA}.{table_name}" if IS_PG else table_name
 
 def FK(table: str, col: str = "id") -> str:
@@ -94,6 +94,7 @@ TEAM_SPORTS = [
     "Piłka nożna plażowa",
 ]
 
+# Zostawiamy listę zajęć, ale NIE pokazujemy filtra „joga itp.” w UI
 FITNESS_CLASSES = [
     "Fitness: Cross",
     "Fitness: Trening obwodowy",
@@ -285,7 +286,8 @@ def cached_list_groups_for_user(user_id: int, schema: str,
         sql += f" AND g.sport IN {clause}"
         params.update(ps)
 
-    if discipline and discipline != "Wszystkie":
+    # Filtr dyscypliny tylko dla sportów drużynowych
+    if activity_type == "Sporty drużynowe" and discipline and discipline != "Wszystkie":
         sql += " AND g.sport = :sp"
         params["sp"] = discipline
 
@@ -306,14 +308,15 @@ def cached_all_groups(uid: int, schema: str,
                       discipline: Optional[str],
                       city_filter: str,
                       postal_filter: str) -> pd.DataFrame:
+    # Uwaga: unikamy parametru w podzapytaniu EXISTS — robimy LEFT JOIN z parametrem w ON
     sql = f"""
-    SELECT g.id, g.name, g.city, g.venue, g.weekday, g.start_time, g.price_cents,
-           g.duration_minutes, g.blik_phone, g.sport, g.postal_code,
-           EXISTS (
-             SELECT 1 FROM {T('memberships')} m
-             WHERE m.user_id=:u AND m.group_id=g.id
-           ) AS is_member
+    SELECT
+        g.id, g.name, g.city, g.venue, g.weekday, g.start_time, g.price_cents,
+        g.duration_minutes, g.blik_phone, g.sport, g.postal_code,
+        CASE WHEN m.user_id IS NOT NULL THEN 1 ELSE 0 END AS is_member
     FROM {T('groups')} g
+    LEFT JOIN {T('memberships')} m
+      ON m.group_id = g.id AND m.user_id = :u
     WHERE 1=1
     """
     params: Dict[str, object] = {"u": int(uid)}
@@ -327,7 +330,8 @@ def cached_all_groups(uid: int, schema: str,
         sql += f" AND g.sport IN {clause}"
         params.update(ps)
 
-    if discipline and discipline != "Wszystkie":
+    # Filtr dyscypliny TYLKO dla sportów drużynowych
+    if activity_type == "Sporty drużynowe" and discipline and discipline != "Wszystkie":
         sql += " AND g.sport = :sp"
         params["sp"] = discipline
 
@@ -722,13 +726,6 @@ def participants_table(group_id: int, event_id: int, show_pay=False):
 # ---------------------------
 # Widoki wydarzeń
 # ---------------------------
-def get_event(event_id: int):
-    with engine.begin() as conn:
-        return conn.execute(
-            select(events.c.id, events.c.group_id, events.c.starts_at, events.c.price_cents, events.c.locked, events.c.name)
-            .where(events.c.id == event_id)
-        ).first()
-
 def upcoming_event_view(event_id: int, uid: int, duration_minutes: int):
     e = get_event(event_id)
     starts = pd.to_datetime(e.starts_at)
@@ -890,7 +887,6 @@ def sidebar_auth_and_filters():
             st.sidebar.error("Telefon w nieprawidłowym formacie (dozwolone: + i 9–15 cyfr).")
         else:
             phone = phone_raw.strip().replace(" ", "").replace("-", "")
-            # sprawdź czy istnieje user o tej naz wie
             with engine.begin() as conn:
                 row = conn.execute(
                     select(users.c.id, users.c.phone).where(users.c.name == name.strip())
@@ -916,7 +912,7 @@ def sidebar_auth_and_filters():
 
     st.sidebar.markdown("---")
 
-    # Filtry
+    # Filtry (dyscyplina tylko dla sportów drużynowych)
     activity_type = st.sidebar.selectbox(
         "Typ aktywności",
         ["Wszystkie", "Sporty drużynowe", "Zajęcia fitness"],
@@ -925,10 +921,9 @@ def sidebar_auth_and_filters():
 
     if activity_type == "Sporty drużynowe":
         discipline = st.sidebar.selectbox("Dyscyplina", ["Wszystkie"] + TEAM_SPORTS, index=0)
-    elif activity_type == "Zajęcia fitness":
-        discipline = st.sidebar.selectbox("Zajęcia", ["Wszystkie"] + FITNESS_CLASSES, index=0)
     else:
-        discipline = st.sidebar.selectbox("Dyscyplina / Zajęcia", ["Wszystkie"] + ALL_DISCIPLINES, index=0)
+        # Brak filtra dla zajęć fitness (usunięte „joga itp.”)
+        discipline = "Wszystkie"
 
     city_filter = st.sidebar.text_input("Miejscowość (filtr)", value="")
     postal_filter = st.sidebar.text_input("Kod pocztowy (filtr)", value="")
