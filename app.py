@@ -1,13 +1,13 @@
 # app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/Neon)
-# Zmiany wg życzenia:
+# Zmiany:
 # - brak tytułu na stronie głównej
-# - sidebar: bez diagnostyki, bez Email; dodany filtr "Sport" (z podziałem na nawierzchnię)
+# - sidebar: bez diagnostyki i emaila; dodany filtr "Sport" (katalog dyscyplin z podziałem)
 # - "Po wydarzeniu" -> "Przeszłe"
-# - dodano możliwość zapisu i edycji goli/asyst (uczestnik edytuje swoje, moderator dowolne)
-# - widoczne wszystkie grupy; szybkie zapisy; płatność po meczu; blokada zapisów przy zaległościach
+# - dodano CRUD goli/asyst (uczestnik edytuje/usuwa swoje; moderator dowolne)
+# - widoczne wszystkie grupy; zapisy; płatność po meczu; blokada zapisów przy zaległościach
+# - działa na Railway/Render (ENV Variables) i Streamlit Cloud (st.secrets)
 
 import os
-import time
 from datetime import datetime, date, timedelta, time as dt_time
 from typing import List, Optional
 
@@ -21,11 +21,10 @@ from sqlalchemy import (
 from sqlalchemy.engine import Engine
 
 # ---------------------------
-# Bezpieczne pobieranie sekretów (działa na Railway/Render i lokalnie)
+# Sekrety / ENV
 # ---------------------------
 def _get_secret(name: str, default: str = "") -> str:
     try:
-        # gdy jest st.secrets (Streamlit Cloud) – użyj, inaczej ENV (Railway)
         return st.secrets.get(name, os.getenv(name, default))
     except Exception:
         return os.getenv(name, default)
@@ -146,7 +145,6 @@ goals = Table(
     Column("event_id", Integer, ForeignKey(f"{DB_SCHEMA}.events.id", ondelete="CASCADE"), nullable=False),
     Column("scorer_id", Integer, ForeignKey(f"{DB_SCHEMA}.users.id", ondelete="SET NULL"), nullable=False),
     Column("assist_id", Integer, ForeignKey(f"{DB_SCHEMA}.users.id", ondelete="SET NULL")),
-    Column("team_id", Integer, ForeignKey(f"{DB_SCHEMA}.teams.id", ondelete="SET NULL")),
     Column("minute", Integer),
     sqlite_autoincrement=True,
     schema=DB_SCHEMA,
@@ -187,7 +185,7 @@ SPORT_CATALOG = [
     "Koszykówka (Hala)",
     "Piłka ręczna (Hala)",
     "Hokej halowy",
-    # Orlik / sztuczna trawa / boisko
+    # Orlik / boisko
     "Piłka nożna (Orlik)",
     "Koszykówka (Street)",
     "Rugby (Boisko)",
@@ -445,7 +443,6 @@ def add_goal(event_id: int, scorer_id: int, assist_id: Optional[int], minute: Op
         )
 
 def update_goal(goal_id: int, scorer_id: int, assist_id: Optional[int], minute: Optional[int], editor_uid: int, is_mod: bool):
-    # tylko moderator lub właściciel strzału może edytować
     with engine.begin() as conn:
         owner = conn.execute(select(goals.c.scorer_id).where(goals.c.id == goal_id)).scalar_one_or_none()
         if owner is None:
@@ -457,7 +454,6 @@ def update_goal(goal_id: int, scorer_id: int, assist_id: Optional[int], minute: 
         )
 
 def delete_goal(goal_id: int, editor_uid: int, is_mod: bool):
-    # tylko moderator lub właściciel strzału może usunąć
     with engine.begin() as conn:
         owner = conn.execute(select(goals.c.scorer_id).where(goals.c.id == goal_id)).scalar_one_or_none()
         if owner is None:
@@ -469,8 +465,15 @@ def delete_goal(goal_id: int, editor_uid: int, is_mod: bool):
 # ---------------------------
 # UI helpers
 # ---------------------------
+def get_event(event_id: int):
+    with engine.begin() as conn:
+        return conn.execute(
+            select(events.c.id, events.c.group_id, events.c.starts_at, events.c.price_cents, events.c.locked)
+            .where(events.c.id == event_id)
+        ).first()
+
 def participants_table(group_id: int, event_id: int, show_pay=False):
-    # jedno zapytanie dla "Przeszłe" (z płatnościami)
+    # „Przeszłe”: jedna kwerenda z płatnościami i statami z meczu
     if show_pay:
         df = pd.read_sql_query(
             f"""
@@ -490,17 +493,19 @@ def participants_table(group_id: int, event_id: int, show_pay=False):
             engine, params={"eid": int(event_id)}
         )
     else:
-        # nadchodzące — pokazujemy listę zapisanych + roczne staty w grupie
-        # (prostota: osobno signups i agregat roczny; ale mógłby być też 1 SQL)
+        # „Nadchodzące”: lista zapisanych + roczne staty w grupie
         signups_df = cached_signups(event_id, DB_SCHEMA)
         if signups_df.empty:
             st.caption("Brak zapisanych.")
             return
+
         e = get_event(event_id)
         year = pd.to_datetime(e.starts_at).year
+
         stats = pd.read_sql_query(
             f"""
-            SELECT u.id AS user_id, u.name,
+            SELECT u.id AS user_id,
+                   u.name AS name_stat,
                    COALESCE(SUM(CASE WHEN g.scorer_id=u.id THEN 1 ELSE 0 END),0) AS goals,
                    COALESCE(SUM(CASE WHEN g.assist_id=u.id THEN 1 ELSE 0 END),0) AS assists
             FROM {DB_SCHEMA}.users u
@@ -513,10 +518,22 @@ def participants_table(group_id: int, event_id: int, show_pay=False):
             """,
             engine, params={"gid": int(e.group_id), "yr": int(year)}
         )
-        df = signups_df.merge(stats, left_on="user_id", right_on="user_id", how="left")
+
+        # merge z sufiksami (nie nadpisujemy 'name' z zapisów)
+        df = signups_df.merge(stats, on="user_id", how="left", suffixes=("", "_stat"))
+
+        # awaryjnie: jeśli z jakiegoś powodu brak 'name', spróbuj name_stat
+        if "name" not in df.columns and "name_stat" in df.columns:
+            df["name"] = df["name_stat"]
+
         df["goals"] = df["goals"].fillna(0).astype(int)
         df["assists"] = df["assists"].fillna(0).astype(int)
-        df = df.sort_values("name")
+
+        # sort po nazwie jeśli jest, inaczej po user_id (fix KeyError: 'name')
+        if "name" in df.columns:
+            df = df.sort_values("name")
+        else:
+            df = df.sort_values("user_id")
 
     df["Statystyki"] = df.apply(lambda r: f"⚽ {int(r['goals'])}  |  🅰 {int(r['assists'])}", axis=1)
     cols = ["name", "Statystyki"]
@@ -524,15 +541,26 @@ def participants_table(group_id: int, event_id: int, show_pay=False):
         df["Zapłacone"] = df["user_marked_paid"].astype(bool)
         df["Potwierdzone (mod)"] = df["moderator_confirmed"].astype(bool)
         cols += ["Zapłacone", "Potwierdzone (mod)"]
-    st.dataframe(df.rename(columns={"name": "Uczestnik"})[["Uczestnik"] + [c for c in cols if c != "name"]],
-                 hide_index=True, use_container_width=True)
 
-def get_event(event_id: int):
-    with engine.begin() as conn:
-        return conn.execute(
-            select(events.c.id, events.c.group_id, events.c.starts_at, events.c.price_cents, events.c.locked)
-            .where(events.c.id == event_id)
-        ).first()
+    # bezpieczne mapowanie kolumn na wyjście
+    view_cols = []
+    if "name" in df.columns:
+        view_cols.append("name")
+    elif "name_stat" in df.columns:
+        # awaryjnie nazwijmy kolumnę na potrzeby wyświetlenia
+        df = df.rename(columns={"name_stat": "name"})
+        view_cols.append("name")
+    else:
+        # ostatecznie pokaż user_id
+        df["name"] = df["user_id"].astype(str)
+        view_cols.append("name")
+
+    view_cols += [c for c in cols if c != "name"]
+
+    st.dataframe(
+        df.rename(columns={"name": "Uczestnik"})[["Uczestnik"] + [c for c in view_cols if c != "name"]],
+        hide_index=True, use_container_width=True
+    )
 
 # ---------------------------
 # Widoki wydarzeń
@@ -580,7 +608,8 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
 
     with st.container(border=True):
         st.subheader("Przeszłe · " + starts.strftime("%d.%m.%Y %H:%M"))
-        st.markdown(f"**Cena hali:** {cents_to_str(int(e.price_cents))} · **Zapisanych:** {count} · **Kwota na osobę:** **{per_head:.2f} zł**")
+        st.markdown(f"**Cena obiektu:** {cents_to_str(int(e.price_cents))} · **Zapisanych:** {count} · **Kwota/os.:** **{per_head:.2f} zł**")
+
         with st.expander("💳 Zapłać / oznacz zapłatę"):
             st.markdown(f"**Numer BLIK / telefon:** `{blik_phone}`")
             if not signups_df.empty and uid in set(signups_df["user_id"]):
@@ -601,12 +630,12 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
         # ---- Gole / Asysty: dodawanie i edycja ----
         st.markdown("---")
         st.subheader("Gole i asysty (edytuj / dodaj)")
-        # Lista zapisanych do wyboru strzelca/asystującego
+
         signups = cached_signups(event_id, DB_SCHEMA)
         user_map = {int(r.user_id): r.name for r in signups.itertuples()}
-        user_options = [(name, uid_) for uid_, name in sorted({k: v for k, v in user_map.items()}.items(), key=lambda x: x[1])]
+        user_options = [(name, uid_) for uid_, name in sorted(user_map.items(), key=lambda x: x[1])]
 
-        # Dodawanie nowego gola
+        # Dodaj gol
         with st.form(f"add_goal_{event_id}", clear_on_submit=True):
             c1, c2, c3, c4 = st.columns([3,3,2,2])
             scorer = c1.selectbox("Strzelec", user_options, format_func=lambda x: x[0] if isinstance(x, tuple) else x, key=f"sc_{event_id}")
@@ -616,7 +645,6 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
         if 'add_btn' in locals() and add_btn:
             scorer_id = int(scorer[1])
             assist_id = None if (assist[1] is None) else int(assist[1])
-            # prawo: uczestnik może dodać własny gol (gdzie jest strzelcem); moderator dowolny
             if is_mod or scorer_id == uid:
                 add_goal(event_id, scorer_id, assist_id, int(minute))
                 st.success("Dodano gola.")
@@ -634,7 +662,14 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
                     cols = st.columns([4,3,1.5,1.5])
                     cols[0].markdown(f"**Gol #{row.id}** — {row.scorer_name or '—'} (asysta: {row.assist_name or '—'})")
                     with cols[1].form(f"edit_goal_{row.id}", clear_on_submit=False):
-                        sc_sel = st.selectbox("Strzelec", user_options, index=max(0, [i for i,(_,uid_) in enumerate(user_options) if uid_==row.scorer_id][0]) if any(uid_==row.scorer_id for _,uid_ in user_options) else 0, key=f"edit_sc_{row.id}")
+                        # strzelec
+                        sc_idx = 0
+                        for i, (_, u) in enumerate(user_options):
+                            if u == row.scorer_id:
+                                sc_idx = i
+                                break
+                        sc_sel = st.selectbox("Strzelec", user_options, index=sc_idx, key=f"edit_sc_{row.id}")
+                        # asysta
                         as_opts = [("— brak —", None)] + user_options
                         as_idx = 0
                         for i,(label,uidx) in enumerate(as_opts):
@@ -650,7 +685,6 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
                     if save:
                         sc_id = int(sc_sel[1])
                         as_id = None if (as_sel[1] is None) else int(as_sel[1])
-                        # prawo edycji: moderator albo właściciel
                         if is_mod or sc_id == uid or row.scorer_id == uid:
                             update_goal(int(row.id), sc_id, as_id, int(minute_val), editor_uid=uid, is_mod=is_mod)
                             st.success("Zaktualizowano gola.")
@@ -670,7 +704,6 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
 # Strony
 # ---------------------------
 def sidebar_auth_and_filters():
-    # brak tytułu głównego, więc zostawmy krótką nazwę w sidebarze
     st.sidebar.header("Panel")
     name = st.sidebar.text_input("Imię / nick")
     phone = st.sidebar.text_input("Telefon (opcjonalnie)")
@@ -685,12 +718,9 @@ def sidebar_auth_and_filters():
             st.session_state["user_name"] = name.strip()
             st.sidebar.success(f"Witaj, {name.strip()}!")
 
-    # Filtr sportu (z podziałem na nawierzchnię – po prostu lista)
     st.sidebar.markdown("---")
     st.sidebar.subheader("Filtr: Sport")
-    sport = st.sidebar.selectbox(
-        "Wybierz sport", ["Wszystkie"] + SPORT_CATALOG, index=0
-    )
+    sport = st.sidebar.selectbox("Wybierz sport", ["Wszystkie"] + SPORT_CATALOG, index=0)
     st.session_state["sport_filter"] = sport
 
     if "user_id" in st.session_state:
@@ -708,6 +738,7 @@ def page_groups():
     uid = st.session_state.get("user_id")
     sport_filter = st.session_state.get("sport_filter", "Wszystkie")
 
+    # Moje grupy
     if uid:
         try:
             my_df = cached_list_groups_for_user(uid, DB_SCHEMA, sport_filter)
@@ -731,7 +762,7 @@ def page_groups():
                             st.session_state["go_panel"] = True
                             st.rerun()
 
-    # Katalog wszystkich grup
+    # Wszystkie grupy
     st.subheader("Wszystkie grupy")
     if uid is None:
         st.caption("Zaloguj się, aby dołączać i zapisywać się na wydarzenia.")
@@ -740,6 +771,7 @@ def page_groups():
     except Exception as e:
         st.error(f"Nie mogę pobrać katalogu grup: {e}")
         return
+
     if all_df.empty:
         st.caption("Brak grup w systemie.")
     else:
@@ -773,7 +805,7 @@ def page_groups():
             name = col1.text_input("Nazwa grupy")
             sport_sel = col1.selectbox("Sport", SPORT_CATALOG, index=0)
             city = col2.text_input("Miejscowość")
-            venue = col2.text_input("Miejsce wydarzenia (hala/boisko/plaza)")
+            venue = col2.text_input("Miejsce wydarzenia (hala/boisko/plaża)")
             weekday = col3.selectbox("Dzień tygodnia", list(range(7)),
                                      format_func=lambda i: ["Pon","Wt","Śr","Czw","Pt","Sob","Nd"][i])
             start_time = col3.text_input("Godzina startu (HH:MM)", value="21:00")
@@ -867,7 +899,7 @@ def page_group_dashboard(group_id: int):
                 past_event_view(int(pickp), uid, duration_minutes, mod, blik_phone)
 
     else:
-        st.info("Tu możesz później rozwinąć ranking i wykresy. Najpierw dopracujmy zapisy/płatności i gole/asysty.")
+        st.info("Tu później ranking i wykresy. Teraz priorytet: zapisy, płatności, gole/asysty.")
         if mod:
             st.markdown("---")
             st.subheader("Narzędzia moderatora")
