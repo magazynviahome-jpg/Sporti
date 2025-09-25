@@ -1,17 +1,9 @@
-# app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/Neon/Railway)
-# Kluczowe funkcje:
-# - Logowanie/rejestracja: WYMAGANY telefon jako „hasło” (twarda walidacja formatu)
-# - Filtry: typ aktywności, dyscyplina/fitness, miejscowość, kod pocztowy
-# - Grupy widoczne dla wszystkich, dołączanie, panel grupy
-# - Wydarzenia: generowanie 12 tygodni; wiele slotów w tym samym dniu (HH:MM;Nazwa)
-# - Zapisy, płatność po meczu; blokada zapisów przy zaległościach
-# - Gole/asysty, edycja (uczestnik swoje, moderator dowolne)
-# - Moderator: generowanie wydarzeń, usuwanie grupy
+# app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/Neon/Railway/SQLite)
 
 import os
 import re
 from datetime import datetime, date, timedelta, time as dt_time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import pandas as pd
 import streamlit as st
@@ -44,14 +36,45 @@ DB_SCHEMA = (_get_secret("DB_SCHEMA", "public") or "public").strip()
 # ---------------------------
 # DB Engine
 # ---------------------------
+pg_connect_args = {
+    "keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10, "keepalives_count": 5
+} if "postgres" in DATABASE_URL else {}
+
 engine: Engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
     pool_size=5,
     max_overflow=0,
     future=True,
-    connect_args={"keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10, "keepalives_count": 5}
+    connect_args=pg_connect_args
 )
+
+# ---------------------------
+# Dialect helpers (PG vs SQLite)
+# ---------------------------
+DIALECT = engine.dialect.name
+IS_PG = DIALECT == "postgresql"
+
+def T(table_name: str) -> str:
+    """Zwraca w pełni kwalifikowaną nazwę tabeli do surowych SQL-i."""
+    return f"{DB_SCHEMA}.{table_name}" if IS_PG else table_name
+
+def FK(table: str, col: str = "id") -> str:
+    """FK target zgodny z dialektem."""
+    return f"{DB_SCHEMA}.{table}.{col}" if IS_PG else f"{table}.{col}"
+
+def NOW_SQL() -> str:
+    return "NOW()" if IS_PG else "CURRENT_TIMESTAMP"
+
+def build_in_clause(name: str, values: List[str]) -> Tuple[str, Dict[str, str]]:
+    """
+    Buduje bezpieczny IN (...) z nazwanymi parametrami :name0, :name1, ...
+    Zwraca: (tekst_klauzuli, dict paramów)
+    """
+    keys = [f":{name}{i}" for i in range(len(values))]
+    clause = "(" + ", ".join(keys) + ")" if keys else "(NULL)"  # pusta lista -> zawsze false: IN (NULL)
+    params = {f"{name}{i}": v for i, v in enumerate(values)}
+    return clause, params
 
 metadata = MetaData()
 
@@ -105,9 +128,10 @@ users = Table(
     Column("id", Integer, primary_key=True),
     Column("name", String(255), nullable=False),
     Column("phone", String(64)),
-    Column("is_admin", Boolean, nullable=False, server_default=text("false") if engine.dialect.name != "sqlite" else text("0")),
+    Column("is_admin", Boolean, nullable=False,
+           server_default=text("false") if IS_PG else text("0")),
     sqlite_autoincrement=True,
-    schema=DB_SCHEMA,
+    schema=DB_SCHEMA if IS_PG else None,
 )
 
 groups = Table(
@@ -120,96 +144,108 @@ groups = Table(
     Column("start_time", String(5), nullable=False),
     Column("price_cents", Integer, nullable=False),
     Column("duration_minutes", Integer, nullable=False, server_default=text("60")),
-    Column("blik_phone", String(64), nullable=False, server_default=text("''") if engine.dialect.name=="postgresql" else text("''")),
-    Column("sport", String(64), nullable=False, server_default=text("'Piłka nożna (Hala)'")),
+    Column("blik_phone", String(64), nullable=False,
+           server_default=text("''")),
+    Column("sport", String(64), nullable=False,
+           server_default=text("'Piłka nożna (Hala)'") if IS_PG else text("Piłka nożna (Hala)")),
     Column("postal_code", String(16), nullable=True),
-    Column("created_by", Integer, ForeignKey(f"{DB_SCHEMA}.users.id", ondelete="SET NULL"), nullable=False),
+    Column("created_by", Integer, ForeignKey(FK("users"), ondelete="SET NULL"), nullable=False),
     sqlite_autoincrement=True,
-    schema=DB_SCHEMA,
+    schema=DB_SCHEMA if IS_PG else None,
 )
 
 memberships = Table(
     "memberships", metadata,
-    Column("user_id", Integer, ForeignKey(f"{DB_SCHEMA}.users.id", ondelete="CASCADE"), primary_key=True),
-    Column("group_id", Integer, ForeignKey(f"{DB_SCHEMA}.groups.id", ondelete="CASCADE"), primary_key=True),
-    Column("role", String(16), nullable=False, server_default=text("'member'")),
-    schema=DB_SCHEMA,
+    Column("user_id", Integer, ForeignKey(FK("users"), ondelete="CASCADE"), primary_key=True),
+    Column("group_id", Integer, ForeignKey(FK("groups"), ondelete="CASCADE"), primary_key=True),
+    Column("role", String(16), nullable=False, server_default=text("'member'") if IS_PG else text("member")),
+    schema=DB_SCHEMA if IS_PG else None,
 )
 
 events = Table(
     "events", metadata,
     Column("id", Integer, primary_key=True),
-    Column("group_id", Integer, ForeignKey(f"{DB_SCHEMA}.groups.id", ondelete="CASCADE"), nullable=False),
+    Column("group_id", Integer, ForeignKey(FK("groups"), ondelete="CASCADE"), nullable=False),
     Column("starts_at", DateTime, nullable=False),
     Column("price_cents", Integer, nullable=False),
-    Column("generated", Boolean, nullable=False, server_default=text("true") if engine.dialect.name!="sqlite" else text("1")),
-    Column("locked", Boolean, nullable=False, server_default=text("false") if engine.dialect.name!="sqlite" else text("0")),
-    Column("name", String(255), nullable=True),  # nazwa zajęć (np. "Pilates", "Joga")
+    Column("generated", Boolean, nullable=False,
+           server_default=text("true") if IS_PG else text("1")),
+    Column("locked", Boolean, nullable=False,
+           server_default=text("false") if IS_PG else text("0")),
+    Column("name", String(255), nullable=True),
     sqlite_autoincrement=True,
-    schema=DB_SCHEMA,
+    schema=DB_SCHEMA if IS_PG else None,
 )
 
 event_signups = Table(
     "event_signups", metadata,
-    Column("event_id", Integer, ForeignKey(f"{DB_SCHEMA}.events.id", ondelete="CASCADE"), primary_key=True),
-    Column("user_id", Integer, ForeignKey(f"{DB_SCHEMA}.users.id", ondelete="CASCADE"), primary_key=True),
+    Column("event_id", Integer, ForeignKey(FK("events"), ondelete="CASCADE"), primary_key=True),
+    Column("user_id", Integer, ForeignKey(FK("users"), ondelete="CASCADE"), primary_key=True),
     Column("signed_at", DateTime, nullable=False),
-    schema=DB_SCHEMA,
+    schema=DB_SCHEMA if IS_PG else None,
 )
 
 payments = Table(
     "payments", metadata,
-    Column("event_id", Integer, ForeignKey(f"{DB_SCHEMA}.events.id", ondelete="CASCADE"), primary_key=True),
-    Column("user_id", Integer, ForeignKey(f"{DB_SCHEMA}.users.id", ondelete="CASCADE"), primary_key=True),
-    Column("user_marked_paid", Boolean, nullable=False, server_default=text("false")),
-    Column("moderator_confirmed", Boolean, nullable=False, server_default=text("false")),
-    schema=DB_SCHEMA,
+    Column("event_id", Integer, ForeignKey(FK("events"), ondelete="CASCADE"), primary_key=True),
+    Column("user_id", Integer, ForeignKey(FK("users"), ondelete="CASCADE"), primary_key=True),
+    Column("user_marked_paid", Boolean, nullable=False, server_default=text("false") if IS_PG else text("0")),
+    Column("moderator_confirmed", Boolean, nullable=False, server_default=text("false") if IS_PG else text("0")),
+    schema=DB_SCHEMA if IS_PG else None,
 )
 
 teams = Table(
     "teams", metadata,
     Column("id", Integer, primary_key=True),
-    Column("event_id", Integer, ForeignKey(f"{DB_SCHEMA}.events.id", ondelete="CASCADE"), nullable=False),
+    Column("event_id", Integer, ForeignKey(FK("events"), ondelete="CASCADE"), nullable=False),
     Column("name", String(255), nullable=False),
     Column("idx", Integer, nullable=False),
     Column("goals", Integer, nullable=False, server_default=text("0")),
     UniqueConstraint("event_id", "idx", name="uq_teams_event_idx"),
     sqlite_autoincrement=True,
-    schema=DB_SCHEMA,
+    schema=DB_SCHEMA if IS_PG else None,
 )
 
 team_members = Table(
     "team_members", metadata,
-    Column("team_id", Integer, ForeignKey(f"{DB_SCHEMA}.teams.id", ondelete="CASCADE"), primary_key=True),
-    Column("user_id", Integer, ForeignKey(f"{DB_SCHEMA}.users.id", ondelete="CASCADE"), primary_key=True),
-    schema=DB_SCHEMA,
+    Column("team_id", Integer, ForeignKey(FK("teams"), ondelete="CASCADE"), primary_key=True),
+    Column("user_id", Integer, ForeignKey(FK("users"), ondelete="CASCADE"), primary_key=True),
+    schema=DB_SCHEMA if IS_PG else None,
 )
 
 goals = Table(
     "goals", metadata,
     Column("id", Integer, primary_key=True),
-    Column("event_id", Integer, ForeignKey(f"{DB_SCHEMA}.events.id", ondelete="CASCADE"), nullable=False),
-    Column("scorer_id", Integer, ForeignKey(f"{DB_SCHEMA}.users.id", ondelete="SET NULL"), nullable=False),
-    Column("assist_id", Integer, ForeignKey(f"{DB_SCHEMA}.users.id", ondelete="SET NULL")),
+    Column("event_id", Integer, ForeignKey(FK("events"), ondelete="CASCADE"), nullable=False),
+    Column("scorer_id", Integer, ForeignKey(FK("users"), ondelete="SET NULL"), nullable=False),
+    Column("assist_id", Integer, ForeignKey(FK("users"), ondelete="SET NULL")),
     Column("minute", Integer),
     sqlite_autoincrement=True,
-    schema=DB_SCHEMA,
+    schema=DB_SCHEMA if IS_PG else None,
 )
 
+# ---------------------------
+# Inicjalizacja / migracje
+# ---------------------------
 def init_db():
     metadata.create_all(engine)
     with engine.begin() as conn:
-        conn.exec_driver_sql(f"ALTER TABLE {DB_SCHEMA}.groups ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 60;")
-        conn.exec_driver_sql(f"ALTER TABLE {DB_SCHEMA}.groups ADD COLUMN IF NOT EXISTS blik_phone TEXT NOT NULL DEFAULT '';")
-        conn.exec_driver_sql(f"ALTER TABLE {DB_SCHEMA}.groups ADD COLUMN IF NOT EXISTS sport TEXT NOT NULL DEFAULT 'Piłka nożna (Hala)';")
-        conn.exec_driver_sql(f"ALTER TABLE {DB_SCHEMA}.groups ADD COLUMN IF NOT EXISTS postal_code TEXT;")
-        conn.exec_driver_sql(f"ALTER TABLE {DB_SCHEMA}.memberships ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'member';")
-        conn.exec_driver_sql(f"ALTER TABLE {DB_SCHEMA}.events ADD COLUMN IF NOT EXISTS name TEXT;")
-        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_events_group_starts ON {DB_SCHEMA}.events (group_id, starts_at);")
-        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_signups_event ON {DB_SCHEMA}.event_signups (event_id);")
-        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_payments_event_user ON {DB_SCHEMA}.payments (event_id, user_id);")
-        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_goals_event_scorer ON {DB_SCHEMA}.goals (event_id, scorer_id);")
-        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_goals_event_assist ON {DB_SCHEMA}.goals (event_id, assist_id);")
+        # Kolumny i indeksy
+        conn.exec_driver_sql(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 60;")
+        conn.exec_driver_sql(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS blik_phone TEXT NOT NULL DEFAULT '';")
+        if IS_PG:
+            conn.exec_driver_sql(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS sport TEXT NOT NULL DEFAULT 'Piłka nożna (Hala)';")
+        else:
+            conn.exec_driver_sql(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS sport TEXT NOT NULL DEFAULT 'Piłka nożna (Hala)';")
+        conn.exec_driver_sql(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS postal_code TEXT;")
+        conn.exec_driver_sql(f"ALTER TABLE {T('memberships')} ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'member';")
+        conn.exec_driver_sql(f"ALTER TABLE {T('events')} ADD COLUMN IF NOT EXISTS name TEXT;")
+
+        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_events_group_starts ON {T('events')} (group_id, starts_at);")
+        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_signups_event ON {T('event_signups')} (event_id);")
+        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_payments_event_user ON {T('payments')} (event_id, user_id);")
+        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_goals_event_scorer ON {T('goals')} (event_id, scorer_id);")
+        conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS idx_goals_event_assist ON {T('goals')} (event_id, assist_id);")
 
 # ---------------------------
 # Utils
@@ -239,30 +275,32 @@ def cached_list_groups_for_user(user_id: int, schema: str,
     SELECT g.id, g.name, g.city, g.venue, g.weekday, g.start_time, g.price_cents,
            g.duration_minutes, g.blik_phone, g.sport, g.postal_code,
            CASE WHEN m.role='moderator' THEN 1 ELSE 0 END AS is_mod
-    FROM {schema}.groups g
-    JOIN {schema}.memberships m ON m.group_id=g.id
-    WHERE m.user_id=%(uid)s
+    FROM {T('groups')} g
+    JOIN {T('memberships')} m ON m.group_id=g.id
+    WHERE m.user_id = :uid
     """
-    params = {"uid": int(user_id)}
+    params: Dict[str, object] = {"uid": int(user_id)}
 
     if activity_type == "Sporty drużynowe":
-        sql += " AND g.sport = ANY (%(ts)s)"
-        params["ts"] = TEAM_SPORTS
+        clause, ps = build_in_clause("ts", TEAM_SPORTS)
+        sql += f" AND g.sport IN {clause}"
+        params.update(ps)
     elif activity_type == "Zajęcia fitness":
-        sql += " AND g.sport = ANY (%(fs)s)"
-        params["fs"] = FITNESS_CLASSES
+        clause, ps = build_in_clause("fs", FITNESS_CLASSES)
+        sql += f" AND g.sport IN {clause}"
+        params.update(ps)
 
     if discipline and discipline != "Wszystkie":
-        sql += " AND g.sport=%(sp)s"
+        sql += " AND g.sport = :sp"
         params["sp"] = discipline
 
     if city_filter:
-        sql += " AND LOWER(g.city) LIKE %(city)s"
+        sql += " AND LOWER(g.city) LIKE :city"
         params["city"] = f"%{city_filter.lower()}%"
 
     if postal_filter:
-        sql += " AND COALESCE(g.postal_code,'') ILIKE %(pc)s"
-        params["pc"] = f"%{postal_filter}%"
+        sql += " AND LOWER(COALESCE(g.postal_code,'')) LIKE :pc"
+        params["pc"] = f"%{postal_filter.lower()}%"
 
     sql += " ORDER BY g.city, g.name"
     return pd.read_sql_query(sql, engine, params=params)
@@ -277,39 +315,41 @@ def cached_all_groups(uid: int, schema: str,
     SELECT g.id, g.name, g.city, g.venue, g.weekday, g.start_time, g.price_cents,
            g.duration_minutes, g.blik_phone, g.sport, g.postal_code,
            EXISTS (
-             SELECT 1 FROM {schema}.memberships m
-             WHERE m.user_id=%(u)s AND m.group_id=g.id
+             SELECT 1 FROM {T('memberships')} m
+             WHERE m.user_id=:u AND m.group_id=g.id
            ) AS is_member
-    FROM {schema}.groups g
+    FROM {T('groups')} g
     WHERE 1=1
     """
-    params = {"u": int(uid)}
+    params: Dict[str, object] = {"u": int(uid)}
 
     if activity_type == "Sporty drużynowe":
-        sql += " AND g.sport = ANY (%(ts)s)"
-        params["ts"] = TEAM_SPORTS
+        clause, ps = build_in_clause("ts", TEAM_SPORTS)
+        sql += f" AND g.sport IN {clause}"
+        params.update(ps)
     elif activity_type == "Zajęcia fitness":
-        sql += " AND g.sport = ANY (%(fs)s)"
-        params["fs"] = FITNESS_CLASSES
+        clause, ps = build_in_clause("fs", FITNESS_CLASSES)
+        sql += f" AND g.sport IN {clause}"
+        params.update(ps)
 
     if discipline and discipline != "Wszystkie":
-        sql += " AND g.sport=%(sp)s"
+        sql += " AND g.sport = :sp"
         params["sp"] = discipline
 
     if city_filter:
-        sql += " AND LOWER(g.city) LIKE %(city)s"
+        sql += " AND LOWER(g.city) LIKE :city"
         params["city"] = f"%{city_filter.lower()}%"
 
     if postal_filter:
-        sql += " AND COALESCE(g.postal_code,'') ILIKE %(pc)s"
-        params["pc"] = f"%{postal_filter}%"
+        sql += " AND LOWER(COALESCE(g.postal_code,'')) LIKE :pc"
+        params["pc"] = f"%{postal_filter.lower()}%"
 
     sql += " ORDER BY g.city, g.name"
     return pd.read_sql_query(sql, engine, params=params)
 
 @st.cache_data(ttl=20)
 def cached_events_df(group_id: int, schema: str) -> pd.DataFrame:
-    base = f"SELECT id, starts_at, price_cents, locked, name FROM {schema}.events WHERE group_id=%(gid)s ORDER BY starts_at"
+    base = f"SELECT id, starts_at, price_cents, locked, name FROM {T('events')} WHERE group_id=:gid ORDER BY starts_at"
     return pd.read_sql_query(base, engine, params={"gid": int(group_id)}, parse_dates=["starts_at"])
 
 @st.cache_data(ttl=20)
@@ -317,9 +357,9 @@ def cached_signups(event_id: int, schema: str) -> pd.DataFrame:
     return pd.read_sql_query(
         f"""
         SELECT es.user_id, u.name
-        FROM {schema}.event_signups es
-        JOIN {schema}.users u ON u.id=es.user_id
-        WHERE es.event_id=%(eid)s
+        FROM {T('event_signups')} es
+        JOIN {T('users')} u ON u.id=es.user_id
+        WHERE es.event_id=:eid
         ORDER BY u.name
         """,
         engine, params={"eid": int(event_id)}
@@ -332,10 +372,10 @@ def cached_signups_with_payments(event_id: int, schema: str) -> pd.DataFrame:
         SELECT es.user_id, u.name,
                COALESCE(p.user_marked_paid, false) AS user_marked_paid,
                COALESCE(p.moderator_confirmed, false) AS moderator_confirmed
-        FROM {schema}.event_signups es
-        JOIN {schema}.users u ON u.id=es.user_id
-        LEFT JOIN {schema}.payments p ON p.event_id=es.event_id AND p.user_id=es.user_id
-        WHERE es.event_id=%(eid)s
+        FROM {T('event_signups')} es
+        JOIN {T('users')} u ON u.id=es.user_id
+        LEFT JOIN {T('payments')} p ON p.event_id=es.event_id AND p.user_id=es.user_id
+        WHERE es.event_id=:eid
         ORDER BY u.name
         """,
         engine, params={"eid": int(event_id)}
@@ -348,10 +388,10 @@ def cached_event_goals(event_id: int, schema: str) -> pd.DataFrame:
         SELECT g.id, g.event_id, g.scorer_id, s.name AS scorer_name,
                g.assist_id, a.name AS assist_name,
                g.minute
-        FROM {schema}.goals g
-        LEFT JOIN {schema}.users s ON s.id=g.scorer_id
-        LEFT JOIN {schema}.users a ON a.id=g.assist_id
-        WHERE g.event_id=%(eid)s
+        FROM {T('goals')} g
+        LEFT JOIN {T('users')} s ON s.id=g.scorer_id
+        LEFT JOIN {T('users')} a ON a.id=g.assist_id
+        WHERE g.event_id=:eid
         ORDER BY COALESCE(g.minute,9999), g.id
         """,
         engine, params={"eid": int(event_id)}
@@ -374,12 +414,12 @@ def user_has_unpaid_past(user_id: int, group_id: int) -> bool:
         sql = f"""
         SELECT EXISTS (
           SELECT 1
-          FROM {DB_SCHEMA}.event_signups es
-          JOIN {DB_SCHEMA}.events e ON e.id=es.event_id
-          LEFT JOIN {DB_SCHEMA}.payments p ON p.event_id=es.event_id AND p.user_id=es.user_id
-          WHERE es.user_id=%(u)s
-            AND e.group_id=%(g)s
-            AND e.starts_at < NOW()
+          FROM {T('event_signups')} es
+          JOIN {T('events')} e ON e.id=es.event_id
+          LEFT JOIN {T('payments')} p ON p.event_id=es.event_id AND p.user_id=es.user_id
+          WHERE es.user_id=:u
+            AND e.group_id=:g
+            AND e.starts_at < {NOW_SQL()}
             AND COALESCE(p.user_marked_paid, false) = false
         ) AS has_debt
         """
@@ -400,51 +440,58 @@ def ensure_user(name: str, phone: str = "") -> int:
         ).first()
 
         if row:
-            # jeżeli istnieje użytkownik o tej nazwie, telefon MUSI pasować
             if (row.phone or "") != norm_phone:
                 raise ValueError("Użytkownik o tej nazwie istnieje z innym numerem telefonu.")
             return int(row.id)
         else:
-            uid = int(conn.execute(
-                insert(users).values(name=name, phone=norm_phone).returning(users.c.id)
-            ).scalar_one())
+            res = conn.execute(
+                insert(users).values(name=name, phone=norm_phone)
+            )
+            # portable PK pobrany bez RETURNING
+            uid = int(res.inserted_primary_key[0])
             return uid
+
+def _insert_membership(conn, user_id: int, group_id: int, role: str):
+    if IS_PG:
+        conn.exec_driver_sql(
+            f"""
+            INSERT INTO {T('memberships')} (user_id, group_id, role)
+            VALUES (:u, :g, :r)
+            ON CONFLICT (user_id, group_id) DO NOTHING;
+            """,
+            {"u": int(user_id), "g": int(group_id), "r": role},
+        )
+    else:
+        conn.exec_driver_sql(
+            f"""
+            INSERT OR IGNORE INTO {T('memberships')} (user_id, group_id, role)
+            VALUES (:u, :g, :r);
+            """,
+            {"u": int(user_id), "g": int(group_id), "r": role},
+        )
 
 def join_group(user_id: int, group_id: int):
     with engine.begin() as conn:
-        conn.exec_driver_sql(
-            f"""
-            INSERT INTO {DB_SCHEMA}.memberships (user_id, group_id, role)
-            VALUES (%(u)s, %(g)s, 'member')
-            ON CONFLICT (user_id, group_id) DO NOTHING;
-            """,
-            {"u": int(user_id), "g": int(group_id)},
-        )
+        _insert_membership(conn, int(user_id), int(group_id), "member")
 
 def create_group(name: str, city: str, venue: str, weekday: int, start_time: str,
                  price_cents: int, blik_phone: str, created_by: int, duration_minutes: int = 60,
                  sport: str = "Piłka nożna (Hala)", postal_code: str = "") -> int:
     with engine.begin() as conn:
-        gid = int(conn.execute(
+        res = conn.execute(
             insert(groups).values(
                 name=name, city=city, venue=venue, weekday=weekday, start_time=start_time,
                 price_cents=price_cents, duration_minutes=duration_minutes, blik_phone=blik_phone,
                 sport=sport, created_by=created_by, postal_code=postal_code or None
-            ).returning(groups.c.id)
-        ).scalar_one())
-        conn.exec_driver_sql(
-            f"""
-            INSERT INTO {DB_SCHEMA}.memberships (user_id, group_id, role)
-            VALUES (%(u)s, %(g)s, 'moderator')
-            ON CONFLICT (user_id, group_id) DO NOTHING;
-            """,
-            {"u": created_by, "g": gid},
+            )
         )
+        gid = int(res.inserted_primary_key[0])
+        _insert_membership(conn, int(created_by), int(gid), "moderator")
         return gid
 
 def delete_group(group_id: int):
     with engine.begin() as conn:
-        conn.exec_driver_sql(f"DELETE FROM {DB_SCHEMA}.groups WHERE id=%(g)s", {"g": int(group_id)})
+        conn.exec_driver_sql(f"DELETE FROM {T('groups')} WHERE id=:g", {"g": int(group_id)})
 
 def create_recurring_events(group_id: int, weekday: int, base_price_cents: int,
                             slots: List[Tuple[str, Optional[str]]], weeks_ahead: int = 12):
@@ -473,7 +520,6 @@ def create_recurring_events(group_id: int, weekday: int, base_price_cents: int,
                     )
 
 def upsert_events_for_group(group_id: int, weeks_ahead: int = 12):
-    # zachowujemy dotychczasowe zachowanie dla pojedynczego bazowego slotu (g.start_time bez nazwy)
     with engine.begin() as conn:
         g = conn.execute(
             select(groups.c.weekday, groups.c.start_time, groups.c.price_cents).where(groups.c.id == group_id)
@@ -485,29 +531,44 @@ def upsert_events_for_group(group_id: int, weeks_ahead: int = 12):
 def sign_up(event_id: int, user_id: int):
     now = datetime.now()
     with engine.begin() as conn:
+        # zapisy
+        if IS_PG:
+            conn.exec_driver_sql(
+                f"""
+                INSERT INTO {T('event_signups')} (event_id, user_id, signed_at)
+                VALUES (:e, :u, :t)
+                ON CONFLICT (event_id, user_id) DO NOTHING;
+                """,
+                {"e": int(event_id), "u": int(user_id), "t": now},
+            )
+        else:
+            conn.exec_driver_sql(
+                f"""
+                INSERT OR IGNORE INTO {T('event_signups')} (event_id, user_id, signed_at)
+                VALUES (:e, :u, :t);
+                """,
+                {"e": int(event_id), "u": int(user_id), "t": now},
+            )
+
+        # płatność (upewnij się, że rekord istnieje)
         conn.exec_driver_sql(
             f"""
-            INSERT INTO {DB_SCHEMA}.event_signups (event_id, user_id, signed_at)
-            VALUES (%(e)s, %(u)s, %(t)s)
-            ON CONFLICT (event_id, user_id) DO NOTHING;
-            """,
-            {"e": int(event_id), "u": int(user_id), "t": now},
-        )
-        conn.exec_driver_sql(
-            f"""
-            INSERT INTO {DB_SCHEMA}.payments (event_id, user_id, user_marked_paid, moderator_confirmed)
-            SELECT %(e)s, %(u)s, false, false
+            INSERT INTO {T('payments')} (event_id, user_id, user_marked_paid, moderator_confirmed)
+            SELECT :e, :u, 0, 0
             WHERE NOT EXISTS (
-               SELECT 1 FROM {DB_SCHEMA}.payments WHERE event_id=%(e)s AND user_id=%(u)s
+               SELECT 1 FROM {T('payments')} WHERE event_id=:e AND user_id=:u
             );
             """,
             {"e": int(event_id), "u": int(user_id)},
         )
+
+        # członkostwo w grupie
         conn.exec_driver_sql(
             f"""
-            INSERT INTO {DB_SCHEMA}.memberships (user_id, group_id, role)
-            SELECT %(u)s, e.group_id, 'member' FROM {DB_SCHEMA}.events e WHERE e.id=%(e)s
-            ON CONFLICT (user_id, group_id) DO NOTHING;
+            INSERT OR IGNORE INTO {T('memberships')} (user_id, group_id, role)
+            SELECT :u, e.group_id, 'member'
+            FROM {T('events')} e
+            WHERE e.id=:e;
             """,
             {"u": int(user_id), "e": int(event_id)},
         )
@@ -515,11 +576,11 @@ def sign_up(event_id: int, user_id: int):
 def withdraw(event_id: int, user_id: int):
     with engine.begin() as conn:
         conn.exec_driver_sql(
-            f"DELETE FROM {DB_SCHEMA}.payments WHERE event_id=%(e)s AND user_id=%(u)s",
+            f"DELETE FROM {T('payments')} WHERE event_id=:e AND user_id=:u",
             {"e": int(event_id), "u": int(user_id)}
         )
         conn.exec_driver_sql(
-            f"DELETE FROM {DB_SCHEMA}.event_signups WHERE event_id=%(e)s AND user_id=%(u)s",
+            f"DELETE FROM {T('event_signups')} WHERE event_id=:e AND user_id=:u",
             {"e": int(event_id), "u": int(user_id)}
         )
 
@@ -528,7 +589,7 @@ def payment_toggle(event_id: int, user_id: int, field: str, value: int):
         return
     with engine.begin() as conn:
         conn.exec_driver_sql(
-            f"UPDATE {DB_SCHEMA}.payments SET {field}=%(v)s WHERE event_id=%(e)s AND user_id=%(u)s",
+            f"UPDATE {T('payments')} SET {field}=:v WHERE event_id=:e AND user_id=:u",
             {"v": bool(value), "e": int(event_id), "u": int(user_id)},
         )
 
@@ -557,7 +618,7 @@ def delete_goal(goal_id: int, editor_uid: int, is_mod: bool):
             return
         if (not is_mod) and int(owner) != int(editor_uid):
             return
-        conn.exec_driver_sql(f"DELETE FROM {DB_SCHEMA}.goals WHERE id=%(g)s", {"g": int(goal_id)})
+        conn.exec_driver_sql(f"DELETE FROM {T('goals')} WHERE id=:g", {"g": int(goal_id)})
 
 # ---------------------------
 # UI helpers
@@ -579,15 +640,15 @@ def participants_table(group_id: int, event_id: int, show_pay=False):
         df = pd.read_sql_query(
             f"""
             SELECT es.user_id, u.name,
-                   COALESCE(p.user_marked_paid,false) AS user_marked_paid,
-                   COALESCE(p.moderator_confirmed,false) AS moderator_confirmed,
+                   COALESCE(p.user_marked_paid, 0) AS user_marked_paid,
+                   COALESCE(p.moderator_confirmed, 0) AS moderator_confirmed,
                    COALESCE(SUM(CASE WHEN g.scorer_id=es.user_id THEN 1 ELSE 0 END),0) AS goals,
                    COALESCE(SUM(CASE WHEN g.assist_id=es.user_id THEN 1 ELSE 0 END),0) AS assists
-            FROM {DB_SCHEMA}.event_signups es
-            JOIN {DB_SCHEMA}.users u ON u.id=es.user_id
-            LEFT JOIN {DB_SCHEMA}.payments p ON p.event_id=es.event_id AND p.user_id=es.user_id
-            LEFT JOIN {DB_SCHEMA}.goals g ON g.event_id=es.event_id
-            WHERE es.event_id=%(eid)s
+            FROM {T('event_signups')} es
+            JOIN {T('users')} u ON u.id=es.user_id
+            LEFT JOIN {T('payments')} p ON p.event_id=es.event_id AND p.user_id=es.user_id
+            LEFT JOIN {T('goals')} g ON g.event_id=es.event_id
+            WHERE es.event_id=:eid
             GROUP BY es.user_id,u.name,p.user_marked_paid,p.moderator_confirmed
             ORDER BY user_marked_paid DESC, u.name
             """,
@@ -602,22 +663,35 @@ def participants_table(group_id: int, event_id: int, show_pay=False):
         e = get_event(event_id)
         year = pd.to_datetime(e.starts_at).year
 
-        stats = pd.read_sql_query(
-            f"""
+        if IS_PG:
+            stats_sql = f"""
             SELECT u.id AS user_id,
                    u.name AS name_stat,
                    COALESCE(SUM(CASE WHEN g.scorer_id=u.id THEN 1 ELSE 0 END),0) AS goals,
                    COALESCE(SUM(CASE WHEN g.assist_id=u.id THEN 1 ELSE 0 END),0) AS assists
-            FROM {DB_SCHEMA}.users u
-            JOIN {DB_SCHEMA}.memberships m ON m.user_id=u.id AND m.group_id=%(gid)s
-            LEFT JOIN {DB_SCHEMA}.events e ON e.group_id=m.group_id
-            LEFT JOIN {DB_SCHEMA}.goals g ON g.event_id=e.id
+            FROM {T('users')} u
+            JOIN {T('memberships')} m ON m.user_id=u.id AND m.group_id=:gid
+            LEFT JOIN {T('events')} e ON e.group_id=m.group_id
+            LEFT JOIN {T('goals')} g ON g.event_id=e.id
             WHERE e.id IS NOT NULL
-              AND EXTRACT(YEAR FROM e.starts_at)=%(yr)s
+              AND EXTRACT(YEAR FROM e.starts_at)=:yr
             GROUP BY u.id, u.name
-            """,
-            engine, params={"gid": int(e.group_id), "yr": int(year)}
-        )
+            """
+        else:
+            stats_sql = f"""
+            SELECT u.id AS user_id,
+                   u.name AS name_stat,
+                   COALESCE(SUM(CASE WHEN g.scorer_id=u.id THEN 1 ELSE 0 END),0) AS goals,
+                   COALESCE(SUM(CASE WHEN g.assist_id=u.id THEN 1 ELSE 0 END),0) AS assists
+            FROM {T('users')} u
+            JOIN {T('memberships')} m ON m.user_id=u.id AND m.group_id=:gid
+            LEFT JOIN {T('events')} e ON e.group_id=m.group_id
+            LEFT JOIN {T('goals')} g ON g.event_id=e.id
+            WHERE e.id IS NOT NULL
+              AND CAST(strftime('%Y', e.starts_at) AS INTEGER)=:yr
+            GROUP BY u.id, u.name
+            """
+        stats = pd.read_sql_query(stats_sql, engine, params={"gid": int(e.group_id), "yr": int(year)})
 
         df = signups_df.merge(stats, on="user_id", how="left", suffixes=("", "_stat"))
         if "name" not in df.columns and "name_stat" in df.columns:
@@ -631,7 +705,6 @@ def participants_table(group_id: int, event_id: int, show_pay=False):
     else:
         df["Statystyki"] = "—"
 
-    # kolumny widoku
     if "name" not in df.columns and "name_stat" in df.columns:
         df = df.rename(columns={"name_stat": "name"})
     if "name" not in df.columns:
@@ -827,7 +900,7 @@ def sidebar_auth_and_filters():
                     st.session_state["user_name"] = name.strip()
                     st.sidebar.success(f"Witaj, {name.strip()}!")
             else:
-                # REJESTRACJA: telefon jest "hasłem" i musi być zapisany
+                # REJESTRACJA
                 try:
                     uid = ensure_user(name.strip(), phone)
                     st.session_state["user_id"] = uid
@@ -838,7 +911,7 @@ def sidebar_auth_and_filters():
 
     st.sidebar.markdown("---")
 
-    # Filtry (bez nagłówka "Filtr: Sport")
+    # Filtry
     activity_type = st.sidebar.selectbox(
         "Typ aktywności",
         ["Wszystkie", "Sporty drużynowe", "Zajęcia fitness"],
