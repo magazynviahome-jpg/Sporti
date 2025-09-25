@@ -1,6 +1,7 @@
-# app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/Neon/Railway/SQLite)
-# Auth: klasyczne hasło (hash scrypt), reset hasła via e-mail (Gmail SMTP)
-# Telefon nadal wymagany przy rejestracji (ale NIE jest już hasłem)
+# app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/SQLite)
+# Auth: e-mail + hasło (scrypt), reset hasła via e-mail (Gmail SMTP)
+# Telefon: pole opcjonalne (NIE jest hasłem)
+# Admin (moderator grupy): panel "Ustawienia (admin)" — limity miejsc + pełny CRUD wydarzeń
 
 import os
 import re
@@ -8,9 +9,10 @@ import hmac
 import binascii
 import smtplib
 import ssl
+import socket
 import secrets
 from email.message import EmailMessage
-from datetime import datetime, date, timedelta, time as dt_time
+from datetime import datetime, date, timedelta, time as dt_time, timezone
 from typing import List, Optional, Tuple, Dict
 
 import pandas as pd
@@ -47,7 +49,7 @@ SMTP_PORT = int(_get_secret("SMTP_PORT", "465") or "465")
 SMTP_USERNAME = _get_secret("SMTP_USERNAME", "")
 SMTP_PASSWORD = _get_secret("SMTP_PASSWORD", "")
 SMTP_FROM = _get_secret("SMTP_FROM", SMTP_USERNAME or "no-reply@example.com")
-BASE_URL = _get_secret("BASE_URL", "http://localhost:8501")  # do reset linków
+BASE_URL = _get_secret("BASE_URL", "http://localhost:8501")  # do linków resetu
 
 # ---------------------------
 # DB Engine
@@ -66,7 +68,7 @@ engine: Engine = create_engine(
 )
 
 # ---------------------------
-# Dialect helpers (PG vs SQLite)
+# Dialect helpers
 # ---------------------------
 DIALECT = engine.dialect.name
 IS_PG = DIALECT == "postgresql"
@@ -123,12 +125,6 @@ def is_team_sport(sport_name: str) -> bool:
 # ---------------------------
 # Walidacje
 # ---------------------------
-def validate_phone(phone: str) -> bool:
-    if not phone:
-        return False
-    p = phone.strip().replace(" ", "").replace("-", "")
-    return bool(re.fullmatch(r"\+?\d{9,15}", p))
-
 def validate_email(email: str) -> bool:
     if not email:
         return False
@@ -164,7 +160,6 @@ def verify_password(password: str, salt_hex: str, key_hex: str, meta: str) -> bo
         _algo, n, r, p, dk = meta.split("$")
         n, r, p, dk = int(n), int(r), int(p), int(dk)
     except Exception:
-        # fallback do naszych stałych, jeśli meta brak/zepsute
         n, r, p, dk = SCRYPT_N, SCRYPT_R, SCRYPT_P, SCRYPT_KEY_LEN
     salt = binascii.unhexlify(salt_hex.encode())
     expected = binascii.unhexlify(key_hex.encode())
@@ -179,7 +174,7 @@ users = Table(
     Column("id", Integer, primary_key=True),
     Column("name", String(255), nullable=False),
     Column("email", String(255), nullable=False),
-    Column("phone", String(64), nullable=False),
+    Column("phone", String(64)),  # opcjonalny
     Column("pwd_salt", String(255)),
     Column("pwd_hash", String(255)),
     Column("pwd_meta", String(255)),
@@ -188,7 +183,6 @@ users = Table(
     schema=DB_SCHEMA if IS_PG else None,
 )
 
-# tokeny do resetu hasła
 password_resets = Table(
     "password_resets", metadata,
     Column("id", Integer, primary_key=True),
@@ -213,6 +207,7 @@ groups = Table(
     Column("blik_phone", String(64), nullable=False, server_default=text("''")),
     Column("sport", String(64), nullable=False, server_default=text("'Piłka nożna (Hala)'") if IS_PG else text("Piłka nożna (Hala)")),
     Column("postal_code", String(16), nullable=True),
+    Column("default_capacity", Integer, nullable=True),  # NOWE: domyślny limit miejsc
     Column("created_by", Integer, ForeignKey(FK("users"), ondelete="SET NULL"), nullable=False),
     sqlite_autoincrement=True,
     schema=DB_SCHEMA if IS_PG else None,
@@ -232,6 +227,7 @@ events = Table(
     Column("group_id", Integer, ForeignKey(FK("groups"), ondelete="CASCADE"), nullable=False),
     Column("starts_at", DateTime, nullable=False),
     Column("price_cents", Integer, nullable=False),
+    Column("capacity", Integer, nullable=True),  # NOWE: limit miejsc dla wydarzenia (nadpisuje domyślny)
     Column("generated", Boolean, nullable=False, server_default=text("true") if IS_PG else text("1")),
     Column("locked", Boolean, nullable=False, server_default=text("false") if IS_PG else text("0")),
     Column("name", String(255), nullable=True),
@@ -292,26 +288,31 @@ goals = Table(
 def init_db():
     metadata.create_all(engine)
     with engine.begin() as conn:
-        # users: kolumny + unikalność email
+        # users
         conn.execute(text(f"ALTER TABLE {T('users')} ADD COLUMN IF NOT EXISTS email TEXT NOT NULL DEFAULT ''"))
-        conn.execute(text(f"ALTER TABLE {T('users')} ADD COLUMN IF NOT EXISTS phone TEXT NOT NULL DEFAULT ''"))
+        conn.execute(text(f"ALTER TABLE {T('users')} ADD COLUMN IF NOT EXISTS phone TEXT"))
         conn.execute(text(f"ALTER TABLE {T('users')} ADD COLUMN IF NOT EXISTS pwd_salt TEXT"))
         conn.execute(text(f"ALTER TABLE {T('users')} ADD COLUMN IF NOT EXISTS pwd_hash TEXT"))
         conn.execute(text(f"ALTER TABLE {T('users')} ADD COLUMN IF NOT EXISTS pwd_meta TEXT"))
-        # indeks/unikalność email
+        # unikalny e-mail
         if IS_PG:
             conn.execute(text(f"CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email ON {T('users')} (email)"))
         else:
             conn.execute(text(f"CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email ON {T('users')}(email)"))
 
-        # reszta migracji
+        # groups
         conn.execute(text(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 60;"))
         conn.execute(text(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS blik_phone TEXT NOT NULL DEFAULT '';"))
         conn.execute(text(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS sport TEXT NOT NULL DEFAULT 'Piłka nożna (Hala)';"))
         conn.execute(text(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS postal_code TEXT;"))
+        conn.execute(text(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS default_capacity INTEGER;"))
+
+        # memberships, events
         conn.execute(text(f"ALTER TABLE {T('memberships')} ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'member';"))
         conn.execute(text(f"ALTER TABLE {T('events')} ADD COLUMN IF NOT EXISTS name TEXT;"))
+        conn.execute(text(f"ALTER TABLE {T('events')} ADD COLUMN IF NOT EXISTS capacity INTEGER;"))
 
+        # indeksy
         conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_events_group_starts ON {T('events')} (group_id, starts_at);"))
         conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_signups_event ON {T('event_signups')} (event_id);"))
         conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_payments_event_user ON {T('payments')} (event_id, user_id);"))
@@ -334,26 +335,45 @@ def next_dates_for_weekday(start_from: date, weekday: int, count: int) -> List[d
     return [first + timedelta(days=7*i) for i in range(count)]
 
 # ---------------------------
-# E-mail
+# E-mail (SSL 465 / STARTTLS 587 + timeout)
 # ---------------------------
 def send_email(to_email: str, subject: str, html_body: str, text_body: Optional[str] = None):
     if not SMTP_USERNAME or not SMTP_PASSWORD:
-        raise RuntimeError("Brak konfiguracji SMTP w st.secrets (SMTP_USERNAME / SMTP_PASSWORD).")
+        raise RuntimeError("Brak konfiguracji SMTP w st.secrets/ENV (SMTP_USERNAME/SMTP_PASSWORD).")
+
     msg = EmailMessage()
-    msg["From"] = SMTP_FROM
+    msg["From"] = SMTP_FROM or SMTP_USERNAME
     msg["To"] = to_email
     msg["Subject"] = subject
     if text_body:
         msg.set_content(text_body)
     msg.add_alternative(html_body, subtype="html")
+
+    timeout = 15
     context = ssl.create_default_context()
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context) as server:
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.send_message(msg)
+
+    try:
+        if str(SMTP_PORT) == "587":
+            with smtplib.SMTP(SMTP_HOST, int(SMTP_PORT), timeout=timeout) as server:
+                server.ehlo()
+                server.starttls(context=context)
+                server.ehlo()
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP_SSL(SMTP_HOST, int(SMTP_PORT), context=context, timeout=timeout) as server:
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+                server.send_message(msg)
+    except smtplib.SMTPAuthenticationError as e:
+        raise RuntimeError("SMTP: błąd logowania (sprawdź App Password Gmail oraz SMTP_USERNAME).") from e
+    except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, socket.timeout, TimeoutError) as e:
+        raise RuntimeError(f"SMTP: problem z połączeniem do {SMTP_HOST}:{SMTP_PORT} (timeout/odrzucone).") from e
+    except Exception as e:
+        raise RuntimeError(f"SMTP: nie udało się wysłać wiadomości: {e}") from e
 
 def create_reset_token_for_user(user_id: int, minutes_valid: int = 15) -> str:
     token = secrets.token_urlsafe(32)
-    expires = datetime.utcnow() + timedelta(minutes=minutes_valid)
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=minutes_valid)).replace(tzinfo=None)
     with engine.begin() as conn:
         conn.execute(
             insert(password_resets).values(
@@ -372,9 +392,9 @@ def consume_reset_token(token: str) -> Optional[int]:
             return None
         if bool(row.used):
             return None
-        if row.expires_at < datetime.utcnow():
+        now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        if row.expires_at < now_utc_naive:
             return None
-        # oznacz jako użyty
         conn.execute(
             update(password_resets).where(password_resets.c.id == int(row.id)).values(used=True)
         )
@@ -391,7 +411,7 @@ def cached_list_groups_for_user(user_id: int, schema: str,
                                 postal_filter: str) -> pd.DataFrame:
     sql = f"""
     SELECT g.id, g.name, g.city, g.venue, g.weekday, g.start_time, g.price_cents,
-           g.duration_minutes, g.blik_phone, g.sport, g.postal_code,
+           g.duration_minutes, g.blik_phone, g.sport, g.postal_code, g.default_capacity,
            CASE WHEN m.role='moderator' THEN 1 ELSE 0 END AS is_mod
     FROM {T('groups')} g
     JOIN {T('memberships')} m ON m.group_id=g.id
@@ -432,7 +452,7 @@ def cached_all_groups(uid: int, schema: str,
     sql = f"""
     SELECT
         g.id, g.name, g.city, g.venue, g.weekday, g.start_time, g.price_cents,
-        g.duration_minutes, g.blik_phone, g.sport, g.postal_code,
+        g.duration_minutes, g.blik_phone, g.sport, g.postal_code, g.default_capacity,
         CASE WHEN m.user_id IS NOT NULL THEN 1 ELSE 0 END AS is_member
     FROM {T('groups')} g
     LEFT JOIN {T('memberships')} m
@@ -467,7 +487,7 @@ def cached_all_groups(uid: int, schema: str,
 
 @st.cache_data(ttl=20)
 def cached_events_df(group_id: int, schema: str) -> pd.DataFrame:
-    base = f"SELECT id, starts_at, price_cents, locked, name FROM {T('events')} WHERE group_id=:gid ORDER BY starts_at"
+    base = f"SELECT id, starts_at, price_cents, capacity, locked, name FROM {T('events')} WHERE group_id=:gid ORDER BY starts_at"
     return pd.read_sql_query(text(base), engine, params={"gid": int(group_id)}, parse_dates=["starts_at"])
 
 @st.cache_data(ttl=20)
@@ -549,20 +569,24 @@ def user_has_unpaid_past(user_id: int, group_id: int) -> bool:
 # ---------------------------
 # Mutacje
 # ---------------------------
-def ensure_user_with_password(name: str, email: str, phone: str, password: str) -> int:
+def ensure_user_with_password(name: str, email: str, password: str, phone: Optional[str]) -> int:
     if not validate_email(email):
         raise ValueError("Podaj prawidłowy e-mail.")
-    if not validate_phone(phone):
-        raise ValueError("Telefon jest wymagany i musi mieć prawidłowy format (+ i 9–15 cyfr).")
     weak = validate_password_strength(password)
     if weak:
         raise ValueError(weak)
 
-    phone_norm = phone.strip().replace(" ", "").replace("-", "")
+    phone_norm = None
+    if phone and phone.strip():
+        p = phone.strip().replace(" ", "").replace("-", "")
+        if re.fullmatch(r"\+?\d{9,15}", p):
+            phone_norm = p
+        else:
+            raise ValueError("Telefon w nieprawidłowym formacie (opcjonalny, ale jeśli podany — poprawny).")
+
     salt_hex, key_hex, meta = hash_password(password)
 
     with engine.begin() as conn:
-        # czy e-mail istnieje?
         exists = conn.execute(select(users.c.id).where(users.c.email == email.strip().lower())).first()
         if exists:
             raise ValueError("Konto z tym adresem e-mail już istnieje.")
@@ -618,13 +642,14 @@ def join_group(user_id: int, group_id: int):
 
 def create_group(name: str, city: str, venue: str, weekday: int, start_time: str,
                  price_cents: int, blik_phone: str, created_by: int, duration_minutes: int = 60,
-                 sport: str = "Piłka nożna (Hala)", postal_code: str = "") -> int:
+                 sport: str = "Piłka nożna (Hala)", postal_code: str = "", default_capacity: Optional[int] = None) -> int:
     with engine.begin() as conn:
         res = conn.execute(
             insert(groups).values(
                 name=name, city=city, venue=venue, weekday=weekday, start_time=start_time,
                 price_cents=price_cents, duration_minutes=duration_minutes, blik_phone=blik_phone,
-                sport=sport, created_by=created_by, postal_code=postal_code or None
+                sport=sport, created_by=created_by, postal_code=postal_code or None,
+                default_capacity=default_capacity
             )
         )
         gid = int(res.inserted_primary_key[0])
@@ -636,7 +661,8 @@ def delete_group(group_id: int):
         conn.execute(text(f"DELETE FROM {T('groups')} WHERE id=:g"), {"g": int(group_id)})
 
 def create_recurring_events(group_id: int, weekday: int, base_price_cents: int,
-                            slots: List[Tuple[str, Optional[str]]], weeks_ahead: int = 12):
+                            slots: List[Tuple[str, Optional[str]]], weeks_ahead: int = 12,
+                            default_capacity: Optional[int] = None):
     dates = next_dates_for_weekday(date.today(), weekday, weeks_ahead)
     with engine.begin() as conn:
         for hhmm, ev_name in slots:
@@ -652,6 +678,7 @@ def create_recurring_events(group_id: int, weekday: int, base_price_cents: int,
                             group_id=group_id,
                             starts_at=starts_at,
                             price_cents=base_price_cents,
+                            capacity=default_capacity,
                             generated=True,
                             name=(ev_name.strip() if ev_name else None)
                         )
@@ -660,15 +687,29 @@ def create_recurring_events(group_id: int, weekday: int, base_price_cents: int,
 def upsert_events_for_group(group_id: int, weeks_ahead: int = 12):
     with engine.begin() as conn:
         g = conn.execute(
-            select(groups.c.weekday, groups.c.start_time, groups.c.price_cents).where(groups.c.id == group_id)
+            select(groups.c.weekday, groups.c.start_time, groups.c.price_cents, groups.c.default_capacity).where(groups.c.id == group_id)
         ).first()
     if not g:
         return
-    create_recurring_events(group_id, int(g.weekday), int(g.price_cents), [(g.start_time, None)], weeks_ahead)
+    create_recurring_events(group_id, int(g.weekday), int(g.price_cents), [(g.start_time, None)], weeks_ahead, g.default_capacity)
 
-def sign_up(event_id: int, user_id: int):
+def _event_current_count(conn, event_id: int) -> int:
+    return int(conn.execute(text(f"SELECT COUNT(*) FROM {T('event_signups')} WHERE event_id=:e"), {"e": int(event_id)}).scalar_one())
+
+def sign_up(event_id: int, user_id: int) -> Tuple[bool, str]:
     now = datetime.now()
     with engine.begin() as conn:
+        # sprawdź limit pojemności
+        cap_row = conn.execute(select(events.c.capacity, events.c.group_id).where(events.c.id == event_id)).first()
+        if not cap_row:
+            return False, "Wydarzenie nie istnieje."
+        cap = cap_row.capacity
+        if cap is not None:
+            cnt = _event_current_count(conn, event_id)
+            if cnt >= int(cap):
+                return False, "Brak miejsc na to wydarzenie."
+
+        # insert signup
         if IS_PG:
             conn.execute(
                 text(
@@ -688,7 +729,7 @@ def sign_up(event_id: int, user_id: int):
                 """),
                 {"e": int(event_id), "u": int(user_id), "t": now},
             )
-
+        # ensure payment row
         conn.execute(
             text(
             f"""
@@ -700,7 +741,7 @@ def sign_up(event_id: int, user_id: int):
             """),
             {"e": int(event_id), "u": int(user_id)},
         )
-
+        # auto-membership
         conn.execute(
             text(
             f"""
@@ -711,6 +752,7 @@ def sign_up(event_id: int, user_id: int):
             """),
             {"u": int(user_id), "e": int(event_id)},
         )
+    return True, "Zapisano na wydarzenie."
 
 def withdraw(event_id: int, user_id: int):
     with engine.begin() as conn:
@@ -726,7 +768,7 @@ def payment_toggle(event_id: int, user_id: int, field: str, value: int):
         conn.execute(text(f"UPDATE {T('payments')} SET {field}=:v WHERE event_id=:e AND user_id=:u"),
                      {"v": bool(value), "e": int(event_id), "u": int(user_id)})
 
-# ---- Goals CRUD ----
+# ---- Goals CRUD (bez zmian merytorycznych) ----
 def add_goal(event_id: int, scorer_id: int, assist_id: Optional[int], minute: Optional[int]):
     with engine.begin() as conn:
         conn.execute(
@@ -759,7 +801,7 @@ def delete_goal(goal_id: int, editor_uid: int, is_mod: bool):
 def get_event(event_id: int):
     with engine.begin() as conn:
         return conn.execute(
-            select(events.c.id, events.c.group_id, events.c.starts_at, events.c.price_cents, events.c.locked, events.c.name)
+            select(events.c.id, events.c.group_id, events.c.starts_at, events.c.price_cents, events.c.capacity, events.c.locked, events.c.name)
             .where(events.c.id == event_id)
         ).first()
 
@@ -806,8 +848,7 @@ def participants_table(group_id: int, event_id: int, show_pay=False):
             JOIN {T('memberships')} m ON m.user_id=u.id AND m.group_id=:gid
             LEFT JOIN {T('events')} e ON e.group_id=m.group_id
             LEFT JOIN {T('goals')} g ON g.event_id=e.id
-            WHERE e.id IS NOT NULL
-              AND EXTRACT(YEAR FROM e.starts_at)=:yr
+            WHERE e.id IS NOT NULL AND EXTRACT(YEAR FROM e.starts_at)=:yr
             GROUP BY u.id, u.name
             """
         else:
@@ -820,8 +861,7 @@ def participants_table(group_id: int, event_id: int, show_pay=False):
             JOIN {T('memberships')} m ON m.user_id=u.id AND m.group_id=:gid
             LEFT JOIN {T('events')} e ON e.group_id=m.group_id
             LEFT JOIN {T('goals')} g ON g.event_id=e.id
-            WHERE e.id IS NOT NULL
-              AND CAST(strftime('%Y', e.starts_at) AS INTEGER)=:yr
+            WHERE e.id IS NOT NULL AND CAST(strftime('%Y', e.starts_at) AS INTEGER)=:yr
             GROUP BY u.id, u.name
             """
         stats = pd.read_sql_query(text(stats_sql), engine, params={"gid": int(e.group_id), "yr": int(year)})
@@ -857,13 +897,6 @@ def participants_table(group_id: int, event_id: int, show_pay=False):
 # ---------------------------
 # Widoki wydarzeń
 # ---------------------------
-def get_event(event_id: int):
-    with engine.begin() as conn:
-        return conn.execute(
-            select(events.c.id, events.c.group_id, events.c.starts_at, events.c.price_cents, events.c.locked, events.c.name)
-            .where(events.c.id == event_id)
-        ).first()
-
 def upcoming_event_view(event_id: int, uid: int, duration_minutes: int):
     e = get_event(event_id)
     starts = pd.to_datetime(e.starts_at)
@@ -872,6 +905,7 @@ def upcoming_event_view(event_id: int, uid: int, duration_minutes: int):
     has_debt = user_has_unpaid_past(uid, gid)
     signups_df = cached_signups(event_id, DB_SCHEMA)
     is_signed = (not signups_df.empty) and (uid in set(signups_df["user_id"]))
+    count = 0 if signups_df.empty else len(signups_df)
 
     with st.container(border=True):
         title = starts.strftime("%d.%m.%Y %H:%M")
@@ -882,6 +916,12 @@ def upcoming_event_view(event_id: int, uid: int, duration_minutes: int):
         if has_debt:
             st.error("**Niezapłacone poprzednie wydarzenie — brak możliwości zapisania się.** Przejdź do zakładki **Przeszłe** i oznacz płatność.")
 
+        # info o pojemności
+        cap = e.capacity
+        if cap:
+            left = max(0, int(cap) - count)
+            st.caption(f"Pojemność: **{count}/{int(cap)}** · wolnych miejsc: **{left}**")
+
         with st.form(f"up_ev_{event_id}", clear_on_submit=False):
             c1, c2 = st.columns([1,3])
             if is_signed:
@@ -890,13 +930,16 @@ def upcoming_event_view(event_id: int, uid: int, duration_minutes: int):
                     withdraw(event_id, uid)
                     st.success("Wypisano z wydarzenia.")
             else:
-                btn = c1.form_submit_button("Zapisz się", disabled=has_debt)
+                disabled = has_debt or (bool(e.capacity) and count >= int(e.capacity))
+                btn = c1.form_submit_button("Zapisz się", disabled=disabled)
                 if btn:
-                    sign_up(event_id, uid)
-                    st.success("Zapisano na wydarzenie.")
+                    ok, msg = sign_up(event_id, uid)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
 
-            count = 0 if signups_df.empty else len(signups_df)
-            approx = (int(e.price_cents)/100) / max(1, count) if count else 0
+            approx = (int(e.price_cents)/100) / max(1, count if is_signed else (count+1)) if (count or e.price_cents) else 0
             c2.caption(f"Obecnie zapisanych: **{count}** · przewidywany koszt/os.: **{approx:.2f} zł** (ostatecznie po meczu)")
 
         st.markdown("**Uczestnicy (roczne statystyki w grupie):**")
@@ -914,7 +957,7 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
         if e.name:
             title += f" · {e.name}"
         st.subheader("Przeszłe · " + title)
-        st.markdown(f"**Cena obiektu:** {cents_to_str(int(e.price_cents))} · **Zapisanych:** {count} · **Kwota/os.:** **{per_head:.2f} zł**")
+        st.markdown(f"**Cena obiektu:** {cents_to_str(int(e.price_cents))} · **Zapisanych:** {count}" + (f" · **Pojemność:** {int(e.capacity)}" if e.capacity else "") + f" · **Kwota/os.:** **{per_head:.2f} zł**")
 
         with st.expander("💳 Zapłać / oznacz zapłatę"):
             st.markdown(f"**Numer BLIK / telefon:** `{blik_phone}`")
@@ -933,39 +976,32 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
         st.markdown("**Uczestnicy · płatności + statystyki w tym meczu:**")
         participants_table(int(e.group_id), event_id, show_pay=True)
 
-        # gole/asysty (jak było) ...
+        # (sekcja gole/asysty zostaje jak wcześniej; dla zwięzłości nie duplikuję tu całej listy z edycją)
 
 # ---------------------------
-# AUTH UI (rejestracja, logowanie, reset)
+# AUTH UI (toggle: logowanie / rejestracja)
 # ---------------------------
 def _rate_limit_ok() -> bool:
     key = "login_attempts"
-    now = datetime.utcnow().timestamp()
+    now = datetime.now(timezone.utc).timestamp()
     attempts = st.session_state.get(key, [])
-    # zostaw tylko ostatnie 10 min
     attempts = [t for t in attempts if now - t < 600]
     st.session_state[key] = attempts
-    if len(attempts) >= 8:
-        return False
-    return True
+    return len(attempts) < 8
 
 def _bump_attempt():
     key = "login_attempts"
-    now = datetime.utcnow().timestamp()
+    now = datetime.now(timezone.utc).timestamp()
     st.session_state.setdefault(key, []).append(now)
 
 def sidebar_auth_and_filters():
     st.sidebar.header("Panel")
 
-    # tryb resetu hasła z linka (query param)
+    # reset hasła przez query param
     qp = st.query_params
-    reset_token = None
-    if "reset" in qp:
-        vals = qp.get("reset")
-        if isinstance(vals, list):
-            reset_token = vals[0]
-        else:
-            reset_token = vals
+    reset_token = qp.get("reset")
+    if isinstance(reset_token, list):
+        reset_token = reset_token[0]
 
     if reset_token:
         st.sidebar.subheader("Ustaw nowe hasło")
@@ -983,91 +1019,88 @@ def sidebar_auth_and_filters():
                     else:
                         update_user_password(uid, new_pw)
                         st.sidebar.success("Hasło zmienione. Zaloguj się.")
-                        # usuń reset z URL
                         st.query_params.clear()
                 except Exception as e:
                     st.sidebar.error(f"Nie udało się zmienić hasła: {e}")
         st.sidebar.markdown("---")
 
-    # Logowanie
-    st.sidebar.subheader("Logowanie")
-    email_login = st.sidebar.text_input("E-mail")
-    pw_login = st.sidebar.text_input("Hasło", type="password")
-    do_login = st.sidebar.button("Zaloguj")
+    # --- Toggle: Logowanie / Rejestracja ---
+    mode = st.sidebar.radio("Konto", ["Logowanie", "Rejestracja"], horizontal=True)
 
-    if do_login:
-        if not _rate_limit_ok():
-            st.sidebar.error("Zbyt wiele prób. Spróbuj ponownie za kilka minut.")
-        else:
-            with engine.begin() as conn:
-                row = conn.execute(
-                    select(users.c.id, users.c.name, users.c.email, users.c.phone, users.c.pwd_salt, users.c.pwd_hash, users.c.pwd_meta)
-                    .where(users.c.email == (email_login or "").strip().lower())
-                ).first()
-            if not row:
-                _bump_attempt()
-                st.sidebar.error("Błędny e-mail lub hasło.")
+    if mode == "Logowanie":
+        st.sidebar.subheader("Logowanie")
+        email_login = st.sidebar.text_input("E-mail")
+        pw_login = st.sidebar.text_input("Hasło", type="password")
+        do_login = st.sidebar.button("Zaloguj")
+
+        if do_login:
+            if not _rate_limit_ok():
+                st.sidebar.error("Zbyt wiele prób. Spróbuj ponownie za kilka minut.")
             else:
-                ok = verify_password(pw_login or "", row.pwd_salt or "", row.pwd_hash or "", row.pwd_meta or "")
-                if not ok:
+                with engine.begin() as conn:
+                    row = conn.execute(
+                        select(users.c.id, users.c.name, users.c.email, users.c.pwd_salt, users.c.pwd_hash, users.c.pwd_meta)
+                        .where(users.c.email == (email_login or "").strip().lower())
+                    ).first()
+                if not row:
                     _bump_attempt()
                     st.sidebar.error("Błędny e-mail lub hasło.")
                 else:
-                    st.session_state["user_id"] = int(row.id)
-                    st.session_state["user_name"] = row.name
-                    st.session_state["user_email"] = row.email
-                    st.sidebar.success(f"Witaj, {row.name}!")
+                    ok = verify_password(pw_login or "", row.pwd_salt or "", row.pwd_hash or "", row.pwd_meta or "")
+                    if not ok:
+                        _bump_attempt()
+                        st.sidebar.error("Błędny e-mail lub hasło.")
+                    else:
+                        st.session_state["user_id"] = int(row.id)
+                        st.session_state["user_name"] = row.name
+                        st.session_state["user_email"] = row.email
+                        st.sidebar.success(f"Witaj, {row.name}!")
 
-    # Reset hasła (wysyłka linku)
-    with st.sidebar.expander("Nie pamiętam hasła"):
-        reset_email = st.text_input("Twój e-mail", key="reset_email")
-        if st.button("Wyślij link resetu"):
-            try:
-                with engine.begin() as conn:
-                    u = conn.execute(select(users.c.id, users.c.email, users.c.name).where(users.c.email == (reset_email or "").strip().lower())).first()
-                if not u:
-                    st.warning("Jeśli adres istnieje w systemie, wyślemy e-mail resetu.")  # nie zdradzaj istnienia konta
-                else:
-                    token = create_reset_token_for_user(int(u.id), minutes_valid=15)
-                    link = f"{BASE_URL}?reset={token}"
-                    html = f"""
-                    <p>Cześć {u.name},</p>
-                    <p>Otrzymaliśmy prośbę o reset hasła do Sport Manager.</p>
-                    <p><a href="{link}">Kliknij tutaj, aby ustawić nowe hasło</a> (link ważny 15 minut).</p>
-                    <p>Jeśli to nie Ty, zignoruj tę wiadomość.</p>
-                    """
-                    send_email(u.email, "Reset hasła — Sport Manager", html, text_body=f"Otwórz link (ważny 15 min): {link}")
+        with st.sidebar.expander("Nie pamiętam hasła"):
+            reset_email = st.text_input("Twój e-mail", key="reset_email")
+            if st.button("Wyślij link resetu"):
+                try:
+                    with engine.begin() as conn:
+                        u = conn.execute(select(users.c.id, users.c.email, users.c.name).where(users.c.email == (reset_email or "").strip().lower())).first()
+                    # nie zdradzamy, czy istnieje
+                    if u:
+                        token = create_reset_token_for_user(int(u.id), minutes_valid=15)
+                        link = f"{BASE_URL}?reset={token}"
+                        html = f"""
+                        <p>Cześć {u.name},</p>
+                        <p>Reset hasła do Sport Manager.</p>
+                        <p><a href="{link}">Kliknij, aby ustawić nowe hasło</a> (link ważny 15 minut).</p>
+                        """
+                        send_email(u.email, "Reset hasła — Sport Manager", html, text_body=f"Link (15 min): {link}")
                     st.success("Jeśli adres istnieje, wysłaliśmy link resetu.")
-            except Exception as e:
-                st.error(f"Nie udało się wysłać maila: {e}")
+                except Exception as e:
+                    st.error(f"Nie udało się wysłać maila: {e}")
+
+    else:
+        st.sidebar.subheader("Rejestracja")
+        reg_name = st.sidebar.text_input("Imię / nick", key="reg_name")
+        reg_email = st.sidebar.text_input("E-mail", key="reg_email")
+        reg_phone = st.sidebar.text_input("Telefon (opcjonalny)", key="reg_phone")
+        reg_pw = st.sidebar.text_input("Hasło", type="password", key="reg_pw")
+        reg_pw2 = st.sidebar.text_input("Powtórz hasło", type="password", key="reg_pw2")
+        do_reg = st.sidebar.button("Utwórz konto")
+
+        if do_reg:
+            if reg_pw != reg_pw2:
+                st.sidebar.error("Hasła nie są takie same.")
+            else:
+                try:
+                    uid = ensure_user_with_password(reg_name, reg_email, reg_pw, reg_phone)
+                    st.session_state["user_id"] = uid
+                    st.session_state["user_name"] = reg_name.strip()
+                    st.session_state["user_email"] = reg_email.strip().lower()
+                    st.sidebar.success("Konto utworzone i zalogowano!")
+                except Exception as e:
+                    st.sidebar.error(str(e))
 
     st.sidebar.markdown("---")
 
-    # Rejestracja (telefon wymagany, e-mail unikalny, hasło)
-    st.sidebar.subheader("Rejestracja")
-    reg_name = st.sidebar.text_input("Imię / nick", key="reg_name")
-    reg_email = st.sidebar.text_input("E-mail", key="reg_email")
-    reg_phone = st.sidebar.text_input("Telefon (wymagany)", key="reg_phone")
-    reg_pw = st.sidebar.text_input("Hasło", type="password", key="reg_pw")
-    reg_pw2 = st.sidebar.text_input("Powtórz hasło", type="password", key="reg_pw2")
-    do_reg = st.sidebar.button("Utwórz konto")
-
-    if do_reg:
-        if reg_pw != reg_pw2:
-            st.sidebar.error("Hasła nie są takie same.")
-        else:
-            try:
-                uid = ensure_user_with_password(reg_name, reg_email, reg_phone, reg_pw)
-                st.session_state["user_id"] = uid
-                st.session_state["user_name"] = reg_name.strip()
-                st.session_state["user_email"] = reg_email.strip().lower()
-                st.sidebar.success("Konto utworzone i zalogowano!")
-            except Exception as e:
-                st.sidebar.error(str(e))
-
-    st.sidebar.markdown("---")
-
-    # Filtry (bez fitnesowych dyscyplin — jak ustalaliśmy)
+    # Filtry (tylko sporty drużynowe mają szczegółową dyscyplinę)
     activity_type = st.sidebar.selectbox(
         "Typ aktywności",
         ["Wszystkie", "Sporty drużynowe", "Zajęcia fitness"],
@@ -1097,7 +1130,7 @@ def sidebar_auth_and_filters():
         st.sidebar.caption("Zaloguj się, aby zapisywać się i zarządzać wydarzeniami.")
 
 # ---------------------------
-# Strony (jak wcześniej)
+# Strony
 # ---------------------------
 def page_groups():
     st.header("Grupy")
@@ -1122,8 +1155,9 @@ def page_groups():
             else:
                 for _, g in my_df.iterrows():
                     with st.container(border=True):
-                        cols = st.columns([3,2,2,2,1.2])
-                        cols[0].markdown(f"**{g['name']}** · {g['sport']}\n\n{g['city']} ({g.get('postal_code','') or ''}) — {g['venue']}")
+                        cols = st.columns([3,2,2,2,1.6])
+                        cap_txt = f" · Limit: {int(g['default_capacity'])}" if pd.notna(g.get("default_capacity")) and g.get("default_capacity") else ""
+                        cols[0].markdown(f"**{g['name']}** · {g['sport']}\n\n{g['city']} ({g.get('postal_code','') or ''}) — {g['venue']}{cap_txt}")
                         cols[1].markdown(f"{time_label(int(g['weekday']), g['start_time'])}")
                         cols[2].markdown(f"Cena: {cents_to_str(int(g['price_cents']))}")
                         cols[3].markdown(f"📱 BLIK: **{g['blik_phone']}**")
@@ -1147,8 +1181,9 @@ def page_groups():
     else:
         for _, g2 in all_df.iterrows():
             with st.container(border=True):
-                c = st.columns([3,2,2,2,1.5])
-                c[0].markdown(f"**{g2['name']}** · {g2['sport']}\n\n{g2['city']} ({g2.get('postal_code','') or ''}) — {g2['venue']}")
+                c = st.columns([3,2,2,2,1.8])
+                cap_txt2 = f" · Limit: {int(g2['default_capacity'])}" if pd.notna(g2.get("default_capacity")) and g2.get("default_capacity") else ""
+                c[0].markdown(f"**{g2['name']}** · {g2['sport']}\n\n{g2['city']} ({g2.get('postal_code','') or ''}) — {g2['venue']}{cap_txt2}")
                 c[1].markdown(f"{time_label(int(g2['weekday']), g2['start_time'])}")
                 c[2].markdown(f"Cena: {cents_to_str(int(g2['price_cents']))}")
                 c[3].markdown(f"📱 BLIK: **{g2['blik_phone']}**")
@@ -1167,7 +1202,7 @@ def page_groups():
                 else:
                     c[4].caption("Zaloguj się, aby wejść")
 
-    # Tworzenie grupy — layout jak ustalaliśmy (3x3 + kolejne sekcje od lewej)
+    # Tworzenie grupy — jak wcześniej (3x3 rzędy) + domyślny limit
     st.markdown("---")
     with st.expander("➕ Utwórz nową grupę", expanded=False):
         with st.form("create_group_form", clear_on_submit=False):
@@ -1197,10 +1232,13 @@ def page_groups():
             else:
                 sport_sel = r4c2.selectbox("Zajęcia", FITNESS_CLASSES, index=0)
 
+            r5c1, r5c2, r5c3 = st.columns(3)
+            default_capacity = r5c1.number_input("Domyślny limit miejsc (opcjonalnie)", min_value=0, step=1, value=0, help="0 = bez limitu")
+
             st.markdown("### Dodatkowe sloty (opcjonalnie)")
             st.caption("Po jednej linii: `HH:MM;Nazwa`. Przykład: `09:00;Pilates`")
-            r5c1, r5c2, r5c3 = st.columns(3)
-            extra_raw = r5c1.text_area("Lista slotów (godzina;nazwa)", height=120, key="extra_slots")
+            r6c1, r6c2, r6c3 = st.columns(3)
+            extra_raw = r6c1.text_area("Lista slotów (godzina;nazwa)", height=120, key="extra_slots")
 
             submitted = st.form_submit_button("Utwórz grupę")
 
@@ -1226,14 +1264,15 @@ def page_groups():
                             if len(hhmm) == 5 and ":" in hhmm:
                                 slots.append((hhmm, None))
                 try:
+                    cap_val = int(default_capacity) if default_capacity and int(default_capacity) > 0 else None
                     gid = create_group(
                         name.strip(), city.strip(), venue.strip(),
                         int(weekday), start_time.strip(),
                         int(round(price * 100)), blik.strip(),
                         int(st.session_state["user_id"]), int(duration_minutes),
-                        sport_sel, postal_code.strip()
+                        sport_sel, postal_code.strip(), cap_val
                     )
-                    create_recurring_events(gid, int(weekday), int(round(price * 100)), slots, weeks_ahead=12)
+                    create_recurring_events(gid, int(weekday), int(round(price * 100)), slots, weeks_ahead=12, default_capacity=cap_val)
                     st.success("Grupa i wydarzenia utworzone.")
                 except Exception as e:
                     st.error(f"Nie udało się utworzyć grupy: {e}")
@@ -1243,18 +1282,20 @@ def page_group_dashboard(group_id: int):
         g = conn.execute(
             select(
                 groups.c.id, groups.c.name, groups.c.city, groups.c.venue, groups.c.weekday,
-                groups.c.start_time, groups.c.price_cents, groups.c.duration_minutes, groups.c.blik_phone, groups.c.sport
+                groups.c.start_time, groups.c.price_cents, groups.c.duration_minutes, groups.c.blik_phone,
+                groups.c.sport, groups.c.default_capacity
             ).where(groups.c.id == group_id)
         ).first()
     if not g:
         st.error("Grupa nie istnieje")
         return
 
-    gid, name, city, venue, weekday, start_time, price_cents, duration_minutes, blik_phone, sport = \
-        int(g.id), g.name, g.city, g.venue, int(g.weekday), g.start_time, int(g.price_cents), int(g.duration_minutes), g.blik_phone, g.sport
+    gid, name, city, venue, weekday, start_time, price_cents, duration_minutes, blik_phone, sport, default_capacity = \
+        int(g.id), g.name, g.city, g.venue, int(g.weekday), g.start_time, int(g.price_cents), int(g.duration_minutes), g.blik_phone, g.sport, g.default_capacity
 
     st.header(f"{name} — {city} · {venue} · {sport}")
-    st.caption(f"Termin bazowy: {time_label(weekday, start_time)} · {duration_minutes} min · Cena: {cents_to_str(price_cents)} · BLIK: {blik_phone}")
+    cap_txt = f" · Domyślny limit: {int(default_capacity)}" if default_capacity else ""
+    st.caption(f"Termin bazowy: {time_label(weekday, start_time)} · {duration_minutes} min · Cena: {cents_to_str(price_cents)} · BLIK: {blik_phone}{cap_txt}")
 
     uid = st.session_state.get("user_id")
     if not uid:
@@ -1264,8 +1305,10 @@ def page_group_dashboard(group_id: int):
 
     mod = is_moderator(uid, gid)
 
-    section = st.radio("Sekcja", ["Nadchodzące", "Przeszłe", "Statystyki" + (" (admin)" if mod else "")],
-                       horizontal=True, label_visibility="collapsed")
+    tabs = ["Nadchodzące", "Przeszłe", "Statystyki"]
+    if mod:
+        tabs.append("Ustawienia (admin)")
+    section = st.radio("Sekcja", tabs, horizontal=True, label_visibility="collapsed")
 
     if section == "Nadchodzące":
         df_all = cached_events_df(gid, DB_SCHEMA)
@@ -1280,7 +1323,9 @@ def page_group_dashboard(group_id: int):
                 def _fmt(i):
                     dt = pd.to_datetime(future.loc[future["id"]==i, "starts_at"].values[0]).strftime("%d.%m.%Y %H:%M")
                     nm = future.loc[future["id"]==i, "name"].values[0]
-                    return f"{dt} · {nm}" if pd.notna(nm) and str(nm).strip() else dt
+                    cap = future.loc[future["id"]==i, "capacity"].values[0]
+                    cap_s = f" · cap {int(cap)}" if pd.notna(cap) and cap else ""
+                    return f"{dt} · {nm}" + cap_s if pd.notna(nm) and str(nm).strip() else dt + cap_s
                 pick = st.selectbox("Wybierz termin", list(future["id"]), format_func=_fmt)
                 upcoming_event_view(int(pick), uid, duration_minutes)
 
@@ -1297,34 +1342,138 @@ def page_group_dashboard(group_id: int):
                 def _fmtp(i):
                     dt = pd.to_datetime(df_all.loc[df_all["id"]==i, "starts_at"].values[0]).strftime("%d.%m.%Y %H:%M")
                     nm = df_all.loc[df_all["id"]==i, "name"].values[0]
-                    return f"{dt} · {nm}" if pd.notna(nm) and str(nm).strip() else dt
+                    cap = df_all.loc[df_all["id"]==i, "capacity"].values[0]
+                    cap_s = f" · cap {int(cap)}" if pd.notna(cap) and cap else ""
+                    return f"{dt} · {nm}" + cap_s if pd.notna(nm) and str(nm).strip() else dt + cap_s
                 pickp = st.selectbox("Wybierz wydarzenie", list(past["id"])[::-1], format_func=_fmtp)
                 past_event_view(int(pickp), uid, duration_minutes, mod, blik_phone)
 
+    elif section == "Ustawienia (admin)" and mod:
+        st.subheader("Ustawienia grupy")
+        with st.form("grp_settings"):
+            cc1, cc2 = st.columns(2)
+            new_default_cap = cc1.number_input("Domyślny limit miejsc dla nowych wydarzeń", min_value=0, step=1, value=int(default_capacity or 0))
+            save_grp = st.form_submit_button("Zapisz ustawienia")
+        if save_grp:
+            with engine.begin() as conn:
+                conn.execute(update(groups).where(groups.c.id == gid).values(default_capacity=(new_default_cap if new_default_cap>0 else None)))
+            st.success("Zapisano ustawienia.")
+            st.cache_data.clear()
+
+        st.markdown("---")
+        st.subheader("Dodaj pojedyncze wydarzenie")
+        with st.form("add_event"):
+            c1, c2, c3 = st.columns(3)
+            date_str = c1.date_input("Data", value=pd.Timestamp.now().date())
+            time_str = c2.text_input("Godzina (HH:MM)", value=start_time or "21:00")
+            ev_name = c3.text_input("Nazwa (opcjonalnie)", value="")
+            c4, c5, c6 = st.columns(3)
+            price_zl = c4.number_input("Cena (zł)", min_value=0.0, step=1.0, value=price_cents/100)
+            capacity_ev = c5.number_input("Limit miejsc (0 = bez limitu)", min_value=0, step=1, value=int(default_capacity or 0))
+            add_ev = c6.form_submit_button("Dodaj wydarzenie")
+        if add_ev:
+            try:
+                h, m = map(int, time_str.split(":"))
+                starts_at = datetime.combine(date_str, dt_time(hour=h, minute=m))
+                with engine.begin() as conn:
+                    conn.execute(
+                        insert(events).values(
+                            group_id=gid,
+                            starts_at=starts_at,
+                            price_cents=int(round(price_zl*100)),
+                            capacity=(int(capacity_ev) if capacity_ev>0 else None),
+                            generated=False,
+                            name=(ev_name.strip() or None)
+                        )
+                    )
+                st.success("Dodano wydarzenie.")
+                st.cache_data.clear()
+            except Exception as e:
+                st.error(f"Nie udało się dodać wydarzenia: {e}")
+
+        st.markdown("---")
+        st.subheader("Lista wydarzeń (edycja / usuwanie)")
+        df_all = cached_events_df(gid, DB_SCHEMA)
+        if df_all.empty:
+            st.caption("Brak wydarzeń.")
+        else:
+            for row in df_all.itertuples():
+                with st.container(border=True):
+                    cols = st.columns([2.2, 1.3, 1.3, 1, 0.8, 0.8])
+                    dt_old = pd.to_datetime(row.starts_at)
+                    cols[0].markdown(f"**{dt_old.strftime('%d.%m.%Y %H:%M')}**" + (f" · {row.name}" if pd.notna(row.name) and str(row.name).strip() else ""))
+                    with cols[1].form(f"edit_ev_{row.id}", clear_on_submit=False):
+                        new_date = st.date_input("Data", value=dt_old.date(), key=f"d_{row.id}")
+                        new_time = st.text_input("Godzina HH:MM", value=dt_old.strftime("%H:%M"), key=f"t_{row.id}")
+                        new_name = st.text_input("Nazwa", value=(row.name or ""), key=f"n_{row.id}")
+                        new_price = st.number_input("Cena (zł)", min_value=0.0, step=1.0, value=row.price_cents/100, key=f"p_{row.id}")
+                        new_cap = st.number_input("Limit (0=bez)", min_value=0, step=1, value=int(row.capacity or 0), key=f"c_{row.id}")
+                        save = st.form_submit_button("Zapisz")
+                    lock_btn = cols[2].button("Zablokuj" if not row.locked else "Odblokuj", key=f"lock_{row.id}")
+                    del_btn = cols[3].button("Usuń", key=f"del_{row.id}")
+                    gen_lbl = "autogen" if row.generated else "ręczne"
+                    cols[4].caption(gen_lbl)
+                    cols[5].caption(f"cap: {int(row.capacity) if row.capacity else '—'}")
+
+                    if save:
+                        try:
+                            hh, mm = map(int, new_time.split(":"))
+                            new_dt = datetime.combine(new_date, dt_time(hour=hh, minute=mm))
+                            with engine.begin() as conn:
+                                conn.execute(
+                                    update(events).where(events.c.id == int(row.id)).values(
+                                        starts_at=new_dt,
+                                        name=(new_name.strip() or None),
+                                        price_cents=int(round(new_price*100)),
+                                        capacity=(int(new_cap) if new_cap>0 else None),
+                                    )
+                                )
+                            st.success("Zaktualizowano wydarzenie.")
+                            st.cache_data.clear()
+                        except Exception as e:
+                            st.error(f"Nie udało się zapisać: {e}")
+
+                    if lock_btn:
+                        with engine.begin() as conn:
+                            conn.execute(update(events).where(events.c.id == int(row.id)).values(locked=(not row.locked)))
+                        st.success("Zmieniono blokadę wydarzenia.")
+                        st.cache_data.clear()
+
+                    if del_btn:
+                        try:
+                            with engine.begin() as conn:
+                                conn.execute(text(f"DELETE FROM {T('events')} WHERE id=:i"), {"i": int(row.id)})
+                            st.success("Usunięto wydarzenie.")
+                            st.cache_data.clear()
+                        except Exception as e:
+                            st.error(f"Nie udało się usunąć: {e}")
+
+        st.markdown("---")
+        st.subheader("Generator zdarzeń")
+        if st.button("Wygeneruj 12 kolejnych wydarzeń (bazowy slot)"):
+            upsert_events_for_group(gid, 12)
+            st.success("Dodano brakujące wydarzenia.")
+            st.cache_data.clear()
+
+        with st.expander("🛑 Usuń grupę (nieodwracalne)"):
+            st.warning("Usunięcie grupy skasuje **wszystko** w tej grupie.")
+            confirm_name = st.text_input("Przepisz nazwę grupy, aby potwierdzić:", key="del_confirm")
+            colA, colB = st.columns([1,3])
+            if colA.button("Usuń grupę", type="primary", use_container_width=True):
+                if confirm_name.strip() != name:
+                    st.error("Nazwa nie pasuje.")
+                else:
+                    try:
+                        delete_group(gid)
+                        st.success("Grupa usunięta.")
+                        st.session_state.pop("selected_group_id", None)
+                        st.session_state["go_groups"] = True
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Nie udało się usunąć grupy: {e}")
+
     else:
         st.info("Tu później ranking i wykresy. Teraz priorytet: zapisy, płatności, gole/asysty.")
-        if mod:
-            st.markdown("---")
-            st.subheader("Narzędzia moderatora")
-            if st.button("Wygeneruj 12 kolejnych wydarzeń (bazowy slot)"):
-                upsert_events_for_group(gid, 12)
-                st.success("Dodano brakujące wydarzenia.")
-            with st.expander("🛑 Usuń grupę (nieodwracalne)"):
-                st.warning("Usunięcie grupy skasuje **wszystko** w tej grupie.")
-                confirm_name = st.text_input("Przepisz nazwę grupy, aby potwierdzić:", key="del_confirm")
-                colA, colB = st.columns([1,3])
-                if colA.button("Usuń grupę", type="primary", use_container_width=True):
-                    if confirm_name.strip() != name:
-                        st.error("Nazwa nie pasuje.")
-                    else:
-                        try:
-                            delete_group(gid)
-                            st.success("Grupa usunięta.")
-                            st.session_state.pop("selected_group_id", None)
-                            st.session_state["go_groups"] = True
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Nie udało się usunąć grupy: {e}")
 
 # ---------------------------
 # Main
