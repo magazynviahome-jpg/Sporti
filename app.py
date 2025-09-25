@@ -4,7 +4,8 @@
 # - Lista wydarzeń (edycja): tylko Godzina, Nazwa, Ilość miejsc; "Zapisz" obok "Usuń"; bez etykiet "ręczne"/"limit"
 # - Usunięto heder "Grupy" w widoku listy
 # - "Wszystkie grupy" pokazuje się dopiero po ustawieniu filtrów; dynamiczny tytuł (np. "Wszystkie grupy — Kęty · Piłka nożna (Hala)")
-# - Poprzednie fixy: PG booleany, SettingWithCopyWarning, kolumna 'generated' w cached_events_df, itp.
+# - Fix: PG booleany (FALSE/TRUE), SettingWithCopyWarning (.copy()/.loc), dodane pole 'generated' w cached_events_df
+# - Fix: syntax error w tabeli goals (ForeignKey(FK("events"), ondelete="CASCADE"))
 
 import os
 import re
@@ -274,7 +275,7 @@ team_members = Table(
 goals = Table(
     "goals", metadata,
     Column("id", Integer, primary_key=True),
-    Column("event_id", Integer, ForeignKey(FK("events'), ondelete='CASCADE"), nullable=False),
+    Column("event_id", Integer, ForeignKey(FK("events"), ondelete="CASCADE"), nullable=False),
     Column("scorer_id", Integer, ForeignKey(FK("users"), ondelete="SET NULL"), nullable=False),
     Column("assist_id", Integer, ForeignKey(FK("users"), ondelete="SET NULL")),
     Column("minute", Integer),
@@ -757,6 +758,7 @@ def sign_up(event_id: int, user_id: int) -> Tuple[bool, str]:
                 {"e": int(event_id), "u": int(user_id)},
             )
 
+        # (Na razie) auto-członkostwo przy zapisie — zostanie zmienione, gdy wdrożymy workflow z akceptacją moda
         conn.execute(
             text(
             f"""
@@ -1196,7 +1198,6 @@ def page_groups():
     if city_filter.strip():
         title_bits.append(city_filter.strip().title())
     if activity_type == "Sporty drużynowe":
-        # pokaż dyscyplinę; "Wszystkie" też akceptujemy
         if discipline:
             title_bits.append(discipline)
     elif activity_type == "Zajęcia fitness":
@@ -1483,15 +1484,12 @@ def page_group_dashboard(group_id: int):
                         new_cap = f3.number_input("Ilość miejsc", min_value=0, step=1, value=int(row.capacity or 0), key=f"c_{row.id}", label_visibility="collapsed")
                         c_s, c_d = st.columns(2)
                         save = c_s.form_submit_button("Zapisz", use_container_width=True)
-                        # Usuń obok Zapisz w tym samym rzędzie
                         delete_in_form = c_d.form_submit_button("Usuń", use_container_width=True)
 
-                    # Obsługa zapisu
                     if save:
                         try:
                             hh, mm = map(int, new_time.split(":"))
-                            # zmieniamy tylko godzinę w obrębie tej samej daty:
-                            new_dt = datetime.combine(dt_old.date(), dt_time(hour=hh, minute=mm))
+                            new_dt = datetime.combine(dt_old.date(), dt_time(hour=hh, minute=mm))  # tylko zmiana godziny
                             with engine.begin() as conn:
                                 conn.execute(
                                     update(events).where(events.c.id == int(row.id)).values(
@@ -1505,7 +1503,6 @@ def page_group_dashboard(group_id: int):
                         except Exception as e:
                             st.error(f"Nie udało się zapisać: {e}")
 
-                    # Obsługa usuwania (z przycisku w tym samym wierszu)
                     if delete_in_form:
                         try:
                             with engine.begin() as conn:
