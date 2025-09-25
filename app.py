@@ -1,12 +1,10 @@
 # app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/SQLite)
-# Zmiany:
-# - Filtry przeniesione do sidebara (nad nawigacją i nad "Twoje Grupy"); "Kod pocztowy" w sidebarze
-# - Lista wydarzeń (edycja/usuwanie) w jednym zwartym wierszu; usunięto przycisk "Zablokuj"
-# - FIX: AttributeError na .generated — dołączenie kolumny generated w cached_events_df
-# - FIX: SettingWithCopyWarning — .copy() i .loc w sekcji "Nadchodzące"
-# - FIX (Postgres): wstawianie do payments używa TRUE/FALSE (PG) lub 0/1 (SQLite)
-# - FIX (Postgres): participants_table(show_pay=True) — COALESCE + rzutowanie boolean -> int
-# - Drobne dopieszczenia UI (kompakt)
+# Ostatnie zmiany:
+# - "Wyloguj" obok "Zaloguj" w sekcji Logowanie
+# - Lista wydarzeń (edycja): tylko Godzina, Nazwa, Ilość miejsc; "Zapisz" obok "Usuń"; bez etykiet "ręczne"/"limit"
+# - Usunięto heder "Grupy" w widoku listy
+# - "Wszystkie grupy" pokazuje się dopiero po ustawieniu filtrów; dynamiczny tytuł (np. "Wszystkie grupy — Kęty · Piłka nożna (Hala)")
+# - Poprzednie fixy: PG booleany, SettingWithCopyWarning, kolumna 'generated' w cached_events_df, itp.
 
 import os
 import re
@@ -276,7 +274,7 @@ team_members = Table(
 goals = Table(
     "goals", metadata,
     Column("id", Integer, primary_key=True),
-    Column("event_id", Integer, ForeignKey(FK("events"), ondelete="CASCADE"), nullable=False),
+    Column("event_id", Integer, ForeignKey(FK("events'), ondelete='CASCADE"), nullable=False),
     Column("scorer_id", Integer, ForeignKey(FK("users"), ondelete="SET NULL"), nullable=False),
     Column("assist_id", Integer, ForeignKey(FK("users"), ondelete="SET NULL")),
     Column("minute", Integer),
@@ -479,7 +477,6 @@ def cached_all_groups(uid: int, schema: str,
 
 @st.cache_data(ttl=20)
 def cached_events_df(group_id: int, schema: str) -> pd.DataFrame:
-    # Dodajemy 'generated', by nie było AttributeError w UI listy
     base = f"SELECT id, starts_at, price_cents, capacity, locked, name, generated FROM {T('events')} WHERE group_id=:gid ORDER BY starts_at"
     return pd.read_sql_query(text(base), engine, params={"gid": int(group_id)}, parse_dates=["starts_at"])
 
@@ -735,7 +732,6 @@ def sign_up(event_id: int, user_id: int) -> Tuple[bool, str]:
                 """),
                 {"e": int(event_id), "u": int(user_id), "t": now},
             )
-        # Wstawienie payments: PG => TRUE/FALSE, SQLite => 0/1
         if IS_PG:
             conn.execute(
                 text(
@@ -981,7 +977,7 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
         participants_table(int(e.group_id), event_id, show_pay=True)
 
 # ---------------------------
-# AUTH UI (sidebar)
+# AUTH UI (sidebar) — z przyciskami obok siebie
 # ---------------------------
 def _rate_limit_ok() -> bool:
     key = "login_attempts"
@@ -997,7 +993,7 @@ def _bump_attempt():
     st.session_state.setdefault(key, []).append(now)
 
 def sidebar_auth_only():
-    # Na samej górze — status logowania
+    # Status logowania
     user_name = st.session_state.get("user_name")
     if user_name:
         st.sidebar.info(f"Zalogowano jako: {user_name}")
@@ -1014,7 +1010,12 @@ def sidebar_auth_only():
         st.sidebar.subheader("Ustaw nowe hasło")
         new_pw = st.sidebar.text_input("Nowe hasło", type="password")
         new_pw2 = st.sidebar.text_input("Powtórz hasło", type="password")
-        change = st.sidebar.button("Zmień hasło")
+        colx, coly = st.sidebar.columns(2)
+        change = colx.button("Zmień hasło")
+        cancel = coly.button("Anuluj")
+        if cancel:
+            st.query_params.clear()
+            st.rerun()
         if change:
             if new_pw != new_pw2:
                 st.sidebar.error("Hasła nie są takie same.")
@@ -1036,7 +1037,14 @@ def sidebar_auth_only():
     if mode == "Logowanie":
         email_login = st.sidebar.text_input("E-mail")
         pw_login = st.sidebar.text_input("Hasło", type="password")
-        do_login = st.sidebar.button("Zaloguj")
+        col1, col2 = st.sidebar.columns(2)
+        do_login = col1.button("Zaloguj")
+        do_logout = col2.button("Wyloguj", disabled=("user_id" not in st.session_state))
+        if do_logout and "user_id" in st.session_state:
+            for k in ["user_id","user_name","user_email","selected_group_id","selected_event_id","nav","go_panel","go_groups",
+                      "activity_type","discipline","city_filter","postal_filter","login_attempts"]:
+                st.session_state.pop(k, None)
+            st.rerun()
         if do_login:
             if not _rate_limit_ok():
                 st.sidebar.error("Zbyt wiele prób. Spróbuj ponownie za kilka minut.")
@@ -1084,7 +1092,14 @@ def sidebar_auth_only():
         reg_email = st.sidebar.text_input("E-mail", key="reg_email")
         reg_pw = st.sidebar.text_input("Hasło", type="password", key="reg_pw")
         reg_pw2 = st.sidebar.text_input("Powtórz hasło", type="password", key="reg_pw2")
-        do_reg = st.sidebar.button("Utwórz konto")
+        col1, col2 = st.sidebar.columns(2)
+        do_reg = col1.button("Utwórz konto")
+        do_logout = col2.button("Wyloguj", disabled=("user_id" not in st.session_state))
+        if do_logout and "user_id" in st.session_state:
+            for k in ["user_id","user_name","user_email","selected_group_id","selected_event_id","nav","go_panel","go_groups",
+                      "activity_type","discipline","city_filter","postal_filter","login_attempts"]:
+                st.session_state.pop(k, None)
+            st.rerun()
         if do_reg:
             if reg_pw != reg_pw2:
                 st.sidebar.error("Hasła nie są takie same.")
@@ -1099,20 +1114,11 @@ def sidebar_auth_only():
                     st.sidebar.error(str(e))
 
     st.sidebar.markdown("---")
-    if "user_id" in st.session_state:
-        if st.sidebar.button("Wyloguj"):
-            for k in ["user_id","user_name","user_email","selected_group_id","selected_event_id","nav","go_panel","go_groups",
-                      "activity_type","discipline","city_filter","postal_filter","login_attempts"]:
-                st.session_state.pop(k, None)
-            st.rerun()
-    else:
-        st.sidebar.caption("Zaloguj się, aby zapisywać się i zarządzać wydarzeniami.")
 
 # ---------------------------
 # Filtry (Sidebar)
 # ---------------------------
 def sidebar_filters():
-    # Domyślne wartości
     activity_type = st.session_state.get("activity_type", "Wszystkie")
     discipline = st.session_state.get("discipline", "Wszystkie")
     city = st.session_state.get("city_filter", "")
@@ -1128,7 +1134,7 @@ def sidebar_filters():
         discipline = "Wszystkie"
 
     city = st.sidebar.text_input("Miejscowość", value=city)
-    postal = st.sidebar.text_input("Kod pocztowy", value=postal)  # <-- w sidebarze, nad "Twoje Grupy"
+    postal = st.sidebar.text_input("Kod pocztowy", value=postal)
 
     st.session_state["activity_type"] = c1
     st.session_state["discipline"] = discipline
@@ -1140,7 +1146,7 @@ def sidebar_filters():
 # Strony
 # ---------------------------
 def page_groups():
-    st.header("Grupy")
+    # Usunięto heder "Grupy"
 
     uid = st.session_state.get("user_id")
     activity_type = st.session_state.get("activity_type", "Wszystkie")
@@ -1175,10 +1181,31 @@ def page_groups():
     else:
         st.caption("Zaloguj się, aby zobaczyć swoje grupy.")
 
-    # Wszystkie grupy
-    st.subheader("Wszystkie grupy")
+    # Wszystkie grupy — tylko gdy ustawiono jakikolwiek filtr
+    filters_active = bool(
+        (activity_type != "Wszystkie") or
+        (city_filter.strip()) or
+        (postal_filter.strip())
+    )
+    if not filters_active:
+        st.info("Ustaw filtry w pasku bocznym, aby zobaczyć dostępne grupy.")
+        return
+
+    # Dynamiczny tytuł sekcji wyników
+    title_bits = []
+    if city_filter.strip():
+        title_bits.append(city_filter.strip().title())
+    if activity_type == "Sporty drużynowe":
+        # pokaż dyscyplinę; "Wszystkie" też akceptujemy
+        if discipline:
+            title_bits.append(discipline)
+    elif activity_type == "Zajęcia fitness":
+        title_bits.append("Zajęcia fitness")
+    st.subheader("Wszystkie grupy — " + " · ".join(title_bits) if title_bits else "Wszystkie grupy")
+
     if uid is None:
         st.caption("Zaloguj się, aby dołączać i zapisywać się na wydarzenia.")
+
     try:
         all_df = cached_all_groups(uid or 0, DB_SCHEMA, activity_type, discipline, city_filter, postal_filter)
     except Exception as e:
@@ -1186,7 +1213,7 @@ def page_groups():
         return
 
     if all_df.empty:
-        st.caption("Brak grup w systemie.")
+        st.caption("Brak grup dla podanych filtrów.")
     else:
         for _, g2 in all_df.iterrows():
             with st.container(border=True):
@@ -1328,11 +1355,10 @@ def page_group_dashboard(group_id: int):
             st.info("Brak wydarzeń w kalendarzu")
         else:
             now = pd.Timestamp.now()
-            future = df_all.loc[df_all["starts_at"] >= now].copy()  # copy() by uniknąć SettingWithCopyWarning
+            future = df_all.loc[df_all["starts_at"] >= now].copy()
             if future.empty:
                 st.caption("Brak nadchodzących wydarzeń.")
             else:
-                # POKAŻ TYLKO NAJBLIŻSZY DZIEŃ
                 future.loc[:, "date_only"] = future["starts_at"].dt.date
                 nearest_date = min(future["date_only"])
                 day_events = future[future["date_only"] == nearest_date].sort_values("starts_at")
@@ -1413,7 +1439,6 @@ def page_group_dashboard(group_id: int):
             c4, c5 = st.columns(2)
             price_zl = c4.number_input("Cena (zł)", min_value=0.0, step=1.0, value=price_cents/100)
             capacity_ev = c5.number_input("Limit miejsc (0 = bez limitu)", min_value=0, step=1, value=int(default_capacity or 0))
-            # Przycisk NA DOLE pod ceną/limitem:
             add_ev = st.form_submit_button("Dodaj wydarzenie")
         if add_ev:
             try:
@@ -1443,36 +1468,35 @@ def page_group_dashboard(group_id: int):
         else:
             for row in df_all.itertuples():
                 with st.container(border=True):
-                    # Jeden kompaktowy wiersz: data/nazwa | edycja (daty/czas/nazwa/cena/limit) | generacja | limit | Usuń
-                    cols = st.columns([2.2, 2.8, 0.8, 0.8, 0.8])
+                    # Kompaktowy 1 wiersz: [data + (nazwa)] | [HH:MM, Nazwa, Ilość] | [Zapisz | Usuń]
+                    cols = st.columns([2.6, 3.6, 1.2])
                     dt_old = pd.to_datetime(row.starts_at)
-                    cols[0].markdown(f"**{dt_old.strftime('%d.%m.%Y %H:%M')}**" + (f" · {row.name}" if pd.notna(row.name) and str(row.name).strip() else ""))
+                    left_title = f"**{dt_old.strftime('%d.%m.%Y %H:%M')}**"
+                    if pd.notna(row.name) and str(row.name).strip():
+                        left_title += f" · {row.name}"
+                    cols[0].markdown(left_title)
 
                     with cols[1].form(f"edit_ev_{row.id}", clear_on_submit=False):
-                        cA, cB, cC, cD, cE = st.columns([1.3, 1.0, 1.5, 1.0, 1.0])
-                        new_date = cA.date_input("Data", value=dt_old.date(), key=f"d_{row.id}", label_visibility="collapsed")
-                        new_time = cB.text_input("HH:MM", value=dt_old.strftime("%H:%M"), key=f"t_{row.id}", label_visibility="collapsed")
-                        new_name = cC.text_input("Nazwa", value=(row.name or ""), key=f"n_{row.id}", label_visibility="collapsed", placeholder="Nazwa")
-                        new_price = cD.number_input("Cena", min_value=0.0, step=1.0, value=row.price_cents/100, key=f"p_{row.id}", label_visibility="collapsed")
-                        new_cap = cE.number_input("Limit", min_value=0, step=1, value=int(row.capacity or 0), key=f"c_{row.id}", label_visibility="collapsed")
-                        save = st.form_submit_button("Zapisz", use_container_width=True)
+                        f1, f2, f3 = st.columns([1.0, 2.0, 1.2])
+                        new_time = f1.text_input("HH:MM", value=dt_old.strftime("%H:%M"), key=f"t_{row.id}", label_visibility="collapsed")
+                        new_name = f2.text_input("Nazwa", value=(row.name or ""), key=f"n_{row.id}", label_visibility="collapsed", placeholder="Nazwa")
+                        new_cap = f3.number_input("Ilość miejsc", min_value=0, step=1, value=int(row.capacity or 0), key=f"c_{row.id}", label_visibility="collapsed")
+                        c_s, c_d = st.columns(2)
+                        save = c_s.form_submit_button("Zapisz", use_container_width=True)
+                        # Usuń obok Zapisz w tym samym rzędzie
+                        delete_in_form = c_d.form_submit_button("Usuń", use_container_width=True)
 
-                    gen_lbl = "autogen" if bool(row.generated) else "ręczne"
-                    cols[2].caption(gen_lbl)
-                    cols[3].caption(f"{'limit' if row.capacity else '—'}")
-
-                    del_btn = cols[4].button("Usuń", key=f"del_{row.id}", use_container_width=True)
-
+                    # Obsługa zapisu
                     if save:
                         try:
                             hh, mm = map(int, new_time.split(":"))
-                            new_dt = datetime.combine(new_date, dt_time(hour=hh, minute=mm))
+                            # zmieniamy tylko godzinę w obrębie tej samej daty:
+                            new_dt = datetime.combine(dt_old.date(), dt_time(hour=hh, minute=mm))
                             with engine.begin() as conn:
                                 conn.execute(
                                     update(events).where(events.c.id == int(row.id)).values(
                                         starts_at=new_dt,
                                         name=(new_name.strip() or None),
-                                        price_cents=int(round(new_price*100)),
                                         capacity=(int(new_cap) if new_cap>0 else None),
                                     )
                                 )
@@ -1481,7 +1505,8 @@ def page_group_dashboard(group_id: int):
                         except Exception as e:
                             st.error(f"Nie udało się zapisać: {e}")
 
-                    if del_btn:
+                    # Obsługa usuwania (z przycisku w tym samym wierszu)
+                    if delete_in_form:
                         try:
                             with engine.begin() as conn:
                                 conn.execute(text(f"DELETE FROM {T('events')} WHERE id=:i"), {"i": int(row.id)})
@@ -1496,23 +1521,6 @@ def page_group_dashboard(group_id: int):
             upsert_events_for_group(gid, 12)
             st.success("Dodano brakujące wydarzenia.")
             st.cache_data.clear()
-
-        with st.expander("🛑 Usuń grupę (nieodwracalne)"):
-            st.warning("Usunięcie grupy skasuje **wszystko** w tej grupie.")
-            confirm_name = st.text_input("Przepisz nazwę grupy, aby potwierdzić:", key="del_confirm")
-            colA, colB = st.columns([1,3])
-            if colA.button("Usuń grupę", type="primary", use_container_width=True):
-                if confirm_name.strip() != name:
-                    st.error("Nazwa nie pasuje.")
-                else:
-                    try:
-                        delete_group(gid)
-                        st.success("Grupa usunięta.")
-                        st.session_state.pop("selected_group_id", None)
-                        st.session_state["go_groups"] = True
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Nie udało się usunąć grupy: {e}")
 
     else:
         st.info("Tu później ranking i wykresy. Teraz priorytet: zapisy, płatności, gole/asysty.")
