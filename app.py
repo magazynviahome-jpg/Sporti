@@ -1,10 +1,11 @@
 # app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/SQLite)
-# Zmiany:
-# - Jedna informacja "Zalogowano jako: ..." przeniesiona na górę (header/topbar) + sync z localStorage (na zawsze)
-# - Usunięto "cap ..." z etykiet terminów (Nadchodzące/Przeszłe – listy wyboru i podglądy)
-# - W "Ustawieniach grupy" dodano sekcję: "Dodaj wiele wydarzeń w jednym dniu" (checkboxy godzin, nazwa, przycisk "Dodaj")
-# - "Nadchodzące" pokazuje WYŁĄCZNIE wydarzenia z najbliższego dnia (wszystkie sloty tego dnia, bez listy select)
-# - Reszta logiki i bezpieczeństwo jak było (hasła, płatności, statystyki)
+# Zmiany w tej wersji:
+# - FIX (Postgres): zamiana COALESCE(..., 0) dla booleanów na COALESCE(..., FALSE) lub odpowiednik dla SQLite
+# - "Zalogowano jako: …" przeniesione z headera do GÓRY SIDEBARA (jak było wcześniej)
+# - Multi-add (checkboxy godzin) przeniesione do GÓRY SIDEBARA (dla moderatora wybranej grupy)
+# - Usunięto sekcję "Dodaj wiele wydarzeń w jednym dniu" z Ustawień grupy
+# - W "Dodaj pojedyncze wydarzenie" przycisk przeniesiony na sam dół formularza i wyrównany
+# - Etykiety terminów bez „cap …”
 
 import os
 import re
@@ -20,7 +21,6 @@ from typing import List, Optional, Tuple, Dict
 
 import pandas as pd
 import streamlit as st
-from streamlit.components.v1 import html as st_html
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Integer, String,
     DateTime, Boolean, ForeignKey, UniqueConstraint, select,
@@ -497,9 +497,20 @@ def cached_signups(event_id: int, schema: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=20)
 def cached_signups_with_payments(event_id: int, schema: str) -> pd.DataFrame:
-    return pd.read_sql_query(
-        text(
-        f"""
+    # PG potrzebuje COALESCE(..., FALSE) dla boolean
+    if IS_PG:
+        sql = f"""
+        SELECT es.user_id, u.name,
+               COALESCE(p.user_marked_paid, FALSE) AS user_marked_paid,
+               COALESCE(p.moderator_confirmed, FALSE) AS moderator_confirmed
+        FROM {T('event_signups')} es
+        JOIN {T('users')} u ON u.id=es.user_id
+        LEFT JOIN {T('payments')} p ON p.event_id=es.event_id AND p.user_id=es.user_id
+        WHERE es.event_id=:eid
+        ORDER BY u.name
+        """
+    else:
+        sql = f"""
         SELECT es.user_id, u.name,
                COALESCE(p.user_marked_paid, 0) AS user_marked_paid,
                COALESCE(p.moderator_confirmed, 0) AS moderator_confirmed
@@ -508,9 +519,8 @@ def cached_signups_with_payments(event_id: int, schema: str) -> pd.DataFrame:
         LEFT JOIN {T('payments')} p ON p.event_id=es.event_id AND p.user_id=es.user_id
         WHERE es.event_id=:eid
         ORDER BY u.name
-        """),
-        engine, params={"eid": int(event_id)}
-    )
+        """
+    return pd.read_sql_query(text(sql), engine, params={"eid": int(event_id)})
 
 @st.cache_data(ttl=20)
 def cached_event_goals(event_id: int, schema: str) -> pd.DataFrame:
@@ -543,18 +553,32 @@ def is_moderator(user_id: int, group_id: int) -> bool:
 
 def user_has_unpaid_past(user_id: int, group_id: int) -> bool:
     with engine.begin() as conn:
-        sql = f"""
-        SELECT EXISTS (
-          SELECT 1
-          FROM {T('event_signups')} es
-          JOIN {T('events')} e ON e.id=es.event_id
-          LEFT JOIN {T('payments')} p ON p.event_id=es.event_id AND p.user_id=es.user_id
-          WHERE es.user_id=:u
-            AND e.group_id=:g
-            AND e.starts_at < {NOW_SQL()}
-            AND COALESCE(p.user_marked_paid, 0) = 0
-        ) AS has_debt
-        """
+        if IS_PG:
+            sql = f"""
+            SELECT EXISTS (
+              SELECT 1
+              FROM {T('event_signups')} es
+              JOIN {T('events')} e ON e.id=es.event_id
+              LEFT JOIN {T('payments')} p ON p.event_id=es.event_id AND p.user_id=es.user_id
+              WHERE es.user_id=:u
+                AND e.group_id=:g
+                AND e.starts_at < {NOW_SQL()}
+                AND COALESCE(p.user_marked_paid, FALSE) = FALSE
+            ) AS has_debt
+            """
+        else:
+            sql = f"""
+            SELECT EXISTS (
+              SELECT 1
+              FROM {T('event_signups')} es
+              JOIN {T('events')} e ON e.id=es.event_id
+              LEFT JOIN {T('payments')} p ON p.event_id=es.event_id AND p.user_id=es.user_id
+              WHERE es.user_id=:u
+                AND e.group_id=:g
+                AND e.starts_at < {NOW_SQL()}
+                AND COALESCE(p.user_marked_paid, 0) = 0
+            ) AS has_debt
+            """
         return bool(conn.execute(text(sql), {"u": int(user_id), "g": int(group_id)}).scalar_one())
 
 # ---------------------------
@@ -763,24 +787,7 @@ def participants_table(group_id: int, event_id: int, show_pay=False):
     team_mode = bool(grp and is_team_sport(grp.sport))
 
     if show_pay:
-        df = pd.read_sql_query(
-            text(
-            f"""
-            SELECT es.user_id, u.name,
-                   COALESCE(p.user_marked_paid, 0) AS user_marked_paid,
-                   COALESCE(p.moderator_confirmed, 0) AS moderator_confirmed,
-                   COALESCE(SUM(CASE WHEN g.scorer_id=es.user_id THEN 1 ELSE 0 END),0) AS goals,
-                   COALESCE(SUM(CASE WHEN g.assist_id=es.user_id THEN 1 ELSE 0 END),0) AS assists
-            FROM {T('event_signups')} es
-            JOIN {T('users')} u ON u.id=es.user_id
-            LEFT JOIN {T('payments')} p ON p.event_id=es.event_id AND p.user_id=es.user_id
-            LEFT JOIN {T('goals')} g ON g.event_id=es.event_id
-            WHERE es.event_id=:eid
-            GROUP BY es.user_id,u.name,p.user_marked_paid,p.moderator_confirmed
-            ORDER BY user_marked_paid DESC, u.name
-            """),
-            engine, params={"eid": int(event_id)}
-        )
+        df = cached_signups_with_payments(event_id, DB_SCHEMA)
     else:
         signups_df = cached_signups(event_id, DB_SCHEMA)
         if signups_df.empty:
@@ -826,7 +833,7 @@ def participants_table(group_id: int, event_id: int, show_pay=False):
         df = df.sort_values("name" if "name" in df.columns else "user_id")
 
     if team_mode:
-        df["Statystyki"] = df.apply(lambda r: f"⚽ {int(r['goals'])}  |  🅰 {int(r['assists'])}", axis=1)
+        df["Statystyki"] = df.apply(lambda r: f"⚽ {int(r.get('goals',0))}  |  🅰 {int(r.get('assists',0))}", axis=1)
     else:
         df["Statystyki"] = "—"
 
@@ -928,7 +935,7 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
         participants_table(int(e.group_id), event_id, show_pay=True)
 
 # ---------------------------
-# AUTH UI (sidebar minimalistyczny)
+# AUTH + Sidebar (góra: status/logowanie + multi-add)
 # ---------------------------
 def _rate_limit_ok() -> bool:
     key = "login_attempts"
@@ -944,6 +951,12 @@ def _bump_attempt():
     st.session_state.setdefault(key, []).append(now)
 
 def sidebar_auth_only():
+    # GÓRA: status logowania (jak było wcześniej)
+    if "user_id" in st.session_state:
+        st.sidebar.info(f"Zalogowano jako: {st.session_state.get('user_name','')}")
+    else:
+        st.sidebar.info("Niezalogowany")
+
     # reset hasła przez query param
     qp = st.query_params
     reset_token = qp.get("reset")
@@ -998,11 +1011,7 @@ def sidebar_auth_only():
                         st.session_state["user_id"] = int(row.id)
                         st.session_state["user_name"] = row.name
                         st.session_state["user_email"] = row.email
-                        # zasygnalizuj sukces (bez powielania komunikatu później)
                         st.sidebar.success("Zalogowano ✔")
-
-                        # SYNC do localStorage (na zawsze) — tylko UI nazwa (nie auth!)
-                        _inject_username_to_local_storage(row.name)
 
         with st.sidebar.expander("Nie pamiętam hasła"):
             reset_email = st.text_input("Twój e-mail", key="reset_email")
@@ -1039,583 +1048,37 @@ def sidebar_auth_only():
                     st.session_state["user_name"] = reg_name.strip()
                     st.session_state["user_email"] = reg_email.strip().lower()
                     st.sidebar.success("Konto utworzone i zalogowano ✔")
-                    _inject_username_to_local_storage(reg_name.strip())
                 except Exception as e:
                     st.sidebar.error(str(e))
 
+    # Multi-add w SIDEBARZE (GÓRA) — tylko dla moderatora aktualnie wybranej grupy
     st.sidebar.markdown("---")
-    # Usuwamy powielony, stały komunikat "Zalogowano jako..." z sidebaru — info w topbar.
-    if "user_id" in st.session_state:
-        if st.sidebar.button("Wyloguj"):
-            for k in ["user_id","user_name","user_email","selected_group_id","selected_event_id","nav","go_panel","go_groups",
-                      "activity_type","discipline","city_filter","postal_filter","login_attempts"]:
-                st.session_state.pop(k, None)
-            # wyczyść także UI nazwę (pozostawiamy w localStorage, ale można też skasować)
-            st.rerun()
-    else:
-        st.sidebar.caption("Zaloguj się, aby zapisywać się i zarządzać wydarzeniami.")
-
-# ---------------------------
-# Filtry (na górze strony)
-# ---------------------------
-def top_filters():
-    activity_type = st.session_state.get("activity_type", "Wszystkie")
-    discipline = st.session_state.get("discipline", "Wszystkie")
-    city = st.session_state.get("city_filter", "")
-    postal = st.session_state.get("postal_filter", "")
-
-    with st.container():
-        st.markdown("### Filtry")
-        c1, c2, c3, c4 = st.columns([1.5, 1.8, 1.4, 1.2])
-        activity_type = c1.selectbox("Typ aktywności", ["Wszystkie", "Sporty drużynowe", "Zajęcia fitness"], index=["Wszystkie","Sporty drużynowe","Zajęcia fitness"].index(activity_type))
-        if activity_type == "Sporty drużynowe":
-            discipline = c2.selectbox("Dyscyplina", ["Wszystkie"] + TEAM_SPORTS, index=(["Wszystkie"] + TEAM_SPORTS).index(discipline) if discipline in (["Wszystkie"]+TEAM_SPORTS) else 0)
-        else:
-            c2.write("")
-            discipline = "Wszystkie"
-        city = c3.text_input("Miejscowość", value=city)
-        postal = c4.text_input("Kod pocztowy", value=postal)
-
-    st.session_state["activity_type"] = activity_type
-    st.session_state["discipline"] = discipline
-    st.session_state["city_filter"] = city.strip()
-    st.session_state["postal_filter"] = postal.strip()
-
-# ---------------------------
-# Strony
-# ---------------------------
-def page_groups():
-    render_topbar()  # login info na samej górze
-    st.header("Grupy")
-
-    # Filtry u góry
-    top_filters()
-
+    gid = st.session_state.get("selected_group_id")
     uid = st.session_state.get("user_id")
-    activity_type = st.session_state.get("activity_type", "Wszystkie")
-    discipline = st.session_state.get("discipline", "Wszystkie")
-    city_filter = st.session_state.get("city_filter", "")
-    postal_filter = st.session_state.get("postal_filter", "")
-
-    # Twoje grupy
-    if uid:
+    if gid and uid:
         try:
-            my_df = cached_list_groups_for_user(uid, DB_SCHEMA, activity_type, discipline, city_filter, postal_filter)
-        except Exception as e:
-            st.error(f"Nie mogę pobrać listy Twoich grup: {e}")
-            my_df = pd.DataFrame()
+            mod = is_moderator(int(uid), int(gid))
+        except Exception:
+            mod = False
+        if mod:
+            st.sidebar.subheader("➕ Dodaj wiele wydarzeń (dzień)")
+            # Pobierz domyślne wartości z grupy
+            with engine.begin() as conn:
+                g = conn.execute(
+                    select(groups.c.price_cents, groups.c.default_capacity).where(groups.c.id == int(gid))
+                ).first()
+            def_price_zl = (g.price_cents/100) if g else 0.0
+            def_cap = int(g.default_capacity or 0) if g else 0
 
-        with st.expander("Twoje grupy", expanded=True):
-            if my_df.empty:
-                st.caption("Nie należysz jeszcze do żadnej grupy.")
-            else:
-                for _, g in my_df.iterrows():
-                    with st.container(border=True):
-                        cols = st.columns([3,2,2,2,1.6])
-                        cap_txt = f" · Limit: {int(g['default_capacity'])}" if pd.notna(g.get("default_capacity")) and g.get("default_capacity") else ""
-                        cols[0].markdown(f"**{g['name']}** · {g['sport']}\n\n{g['city']} ({g.get('postal_code','') or ''}) — {g['venue']}{cap_txt}")
-                        cols[1].markdown(f"{time_label(int(g['weekday']), g['start_time'])}")
-                        cols[2].markdown(f"Cena: {cents_to_str(int(g['price_cents']))}")
-                        cols[3].markdown(f"📱 BLIK: **{g['blik_phone']}**")
-                        if cols[4].button("Wejdź", key=f"enter_my_{g['id']}"):
-                            st.session_state["selected_group_id"] = int(g['id'])
-                            st.session_state["go_panel"] = True
-                            st.rerun()
-
-    # Wszystkie grupy
-    st.subheader("Wszystkie grupy")
-    if uid is None:
-        st.caption("Zaloguj się, aby dołączać i zapisywać się na wydarzenia.")
-    try:
-        all_df = cached_all_groups(uid or 0, DB_SCHEMA, activity_type, discipline, city_filter, postal_filter)
-    except Exception as e:
-        st.error(f"Nie mogę pobrać katalogu grup: {e}")
-        return
-
-    if all_df.empty:
-        st.caption("Brak grup w systemie.")
-    else:
-        for _, g2 in all_df.iterrows():
-            with st.container(border=True):
-                c = st.columns([3,2,2,2,1.8])
-                cap_txt2 = f" · Limit: {int(g2['default_capacity'])}" if pd.notna(g2.get("default_capacity")) and g2.get("default_capacity") else ""
-                c[0].markdown(f"**{g2['name']}** · {g2['sport']}\n\n{g2['city']} ({g2.get('postal_code','') or ''}) — {g2['venue']}{cap_txt2}")
-                c[1].markdown(f"{time_label(int(g2['weekday']), g2['start_time'])}")
-                c[2].markdown(f"Cena: {cents_to_str(int(g2['price_cents']))}")
-                c[3].markdown(f"📱 BLIK: **{g2['blik_phone']}**")
-                if uid:
-                    if bool(g2["is_member"]):
-                        if c[4].button("Wejdź", key=f"enter_all_{g2['id']}"):
-                            st.session_state["selected_group_id"] = int(g2['id'])
-                            st.session_state["go_panel"] = True
-                            st.rerun()
-                    else:
-                        if c[4].button("Dołącz", key=f"join_{g2['id']}"):
-                            join_group(int(uid), int(g2['id']))
-                            st.session_state["selected_group_id"] = int(g2['id'])
-                            st.session_state["go_panel"] = True
-                            st.rerun()
-                else:
-                    c[4].caption("Zaloguj się, aby wejść")
-
-    # Tworzenie grupy
-    st.markdown("---")
-    with st.expander("➕ Utwórz nową grupę", expanded=False):
-        with st.form("create_group_form", clear_on_submit=False):
-            st.markdown("### Dane grupy")
-
-            r1c1, r1c2, r1c3 = st.columns(3)
-            name = r1c1.text_input("Nazwa grupy")
-            city = r1c2.text_input("Miejscowość")
-            postal_code = r1c3.text_input("Kod pocztowy (np. 00-001)")
-
-            r2c1, r2c2, r2c3 = st.columns(3)
-            venue = r2c1.text_input("Miejsce wydarzenia (hala/boisko/plaża)")
-            weekday = r2c2.selectbox("Dzień tygodnia", list(range(7)),
-                                     format_func=lambda i: ["Pon","Wt","Śr","Czw","Pt","Sob","Nd"][i])
-            start_time = r2c3.text_input("Godzina bazowa (HH:MM)", value="21:00")
-
-            r3c1, r3c2, r3c3 = st.columns(3)
-            duration_minutes = r3c1.number_input("Czas gry / zajęć (min)", min_value=30, max_value=240, step=15, value=60)
-            price = r3c2.number_input("Cena za obiekt/zajęcia (zł)", min_value=0.0, step=1.0)
-            blik = r3c3.text_input("Numer BLIK/telefon do płatności")
-
-            st.markdown("### Typ aktywności")
-            r4c1, r4c2, _ = st.columns(3)
-            activity_type_f = r4c1.selectbox("Typ aktywności", ["Sporty drużynowe", "Zajęcia fitness"])
-            if activity_type_f == "Sporty drużynowe":
-                sport_sel = r4c2.selectbox("Dyscyplina", TEAM_SPORTS, index=0)
-            else:
-                sport_sel = r4c2.selectbox("Zajęcia", FITNESS_CLASSES, index=0)
-
-            r5c1, _, _ = st.columns(3)
-            default_capacity = r5c1.number_input("Domyślny limit miejsc (opcjonalnie)", min_value=0, step=1, value=0, help="0 = bez limitu")
-
-            st.markdown("### Dodatkowe sloty (opcjonalnie)")
-            st.caption("Po jednej linii: `HH:MM;Nazwa`. Przykład: `09:00;Pilates`")
-            r6c1, _, _ = st.columns(3)
-            extra_raw = r6c1.text_area("Lista slotów (godzina;nazwa)", height=120, key="extra_slots")
-
-            submitted = st.form_submit_button("Utwórz grupę")
-
-        if submitted:
-            if "user_id" not in st.session_state:
-                st.error("Zaloguj się, aby tworzyć grupy.")
-            elif not all([name.strip(), city.strip(), venue.strip(), blik.strip()]):
-                st.error("Uzupełnij wszystkie pola (w tym numer BLIK).")
-            elif ":" not in start_time or len(start_time) != 5:
-                st.error("Podaj **godzinę bazową** w formacie HH:MM (np. 21:00).")
-            else:
-                slots: List[Tuple[str, Optional[str]]] = [(start_time.strip(), None)]
-                if extra_raw and extra_raw.strip():
-                    for line in extra_raw.strip().splitlines():
-                        if ";" in line:
-                            hhmm, nm = line.split(";", 1)
-                            hhmm = hhmm.strip(); nm = nm.strip()
-                            if len(hhmm) == 5 and ":" in hhmm and nm:
-                                slots.append((hhmm, nm))
-                        else:
-                            hhmm = line.strip()
-                            if len(hhmm) == 5 and ":" in hhmm:
-                                slots.append((hhmm, None))
-                try:
-                    cap_val = int(default_capacity) if default_capacity and int(default_capacity) > 0 else None
-                    gid = create_group(
-                        name.strip(), city.strip(), venue.strip(),
-                        int(weekday), start_time.strip(),
-                        int(round(price * 100)), blik.strip(),
-                        int(st.session_state["user_id"]), int(duration_minutes),
-                        sport_sel, postal_code.strip(), cap_val
-                    )
-                    create_recurring_events(gid, int(weekday), int(round(price * 100)), slots, weeks_ahead=12, default_capacity=cap_val)
-                    st.success("Grupa i wydarzenia utworzone.")
-                    st.cache_data.clear()
-                    st.session_state["selected_group_id"] = int(gid)
-                    st.session_state["go_panel"] = True
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Nie udało się utworzyć grupy: {e}")
-
-def page_group_dashboard(group_id: int):
-    render_topbar()  # login info na samej górze
-
-    with engine.begin() as conn:
-        g = conn.execute(
-            select(
-                groups.c.id, groups.c.name, groups.c.city, groups.c.venue, groups.c.weekday,
-                groups.c.start_time, groups.c.price_cents, groups.c.duration_minutes, groups.c.blik_phone,
-                groups.c.sport, groups.c.default_capacity, groups.c.postal_code
-            ).where(groups.c.id == group_id)
-        ).first()
-    if not g:
-        st.error("Grupa nie istnieje")
-        return
-
-    gid, name, city, venue, weekday, start_time, price_cents, duration_minutes, blik_phone, sport, default_capacity, postal_code = \
-        int(g.id), g.name, g.city, g.venue, int(g.weekday), g.start_time, int(g.price_cents), int(g.duration_minutes), g.blik_phone, g.sport, g.default_capacity, g.postal_code
-
-    st.header(f"{name} — {city} · {venue} · {sport}")
-    cap_txt = f" · Domyślny limit: {int(default_capacity)}" if default_capacity else ""
-    st.caption(f"Termin bazowy: {time_label(weekday, start_time)} · {duration_minutes} min · Cena: {cents_to_str(price_cents)} · BLIK: {blik_phone}{cap_txt}")
-
-    uid = st.session_state.get("user_id")
-    if not uid:
-        st.info("Zaloguj się, aby zapisywać się i zarządzać wydarzeniami.")
-        return
-    uid = int(uid)
-
-    mod = is_moderator(uid, gid)
-
-    tabs = ["Nadchodzące", "Przeszłe", "Statystyki"]
-    if mod:
-        tabs.append("Ustawienia grupy")
-    section = st.radio("Sekcja", tabs, horizontal=True, label_visibility="collapsed")
-
-    if section == "Nadchodzące":
-        df_all = cached_events_df(gid, DB_SCHEMA)
-        if df_all.empty:
-            st.info("Brak wydarzeń w kalendarzu")
-        else:
-            now = pd.Timestamp.now()
-            future = df_all[df_all["starts_at"] >= now]
-            if future.empty:
-                st.caption("Brak nadchodzących wydarzeń.")
-            else:
-                # Pokaż TYLKO wydarzenia z najbliższego dnia
-                future["date_only"] = future["starts_at"].dt.date
-                nearest_date = min(future["date_only"])
-                day_events = future[future["date_only"] == nearest_date].sort_values("starts_at")
-
-                st.subheader(f"Najbliższy dzień: {pd.to_datetime(nearest_date).strftime('%d.%m.%Y')}")
-                for row in day_events.itertuples():
-                    upcoming_event_view(int(row.id), uid, duration_minutes)
-
-    elif section == "Przeszłe":
-        df_all = cached_events_df(gid, DB_SCHEMA)
-        if df_all.empty:
-            st.info("Brak wydarzeń")
-        else:
-            now = pd.Timestamp.now()
-            past = df_all[df_all["starts_at"] < now]
-            if past.empty:
-                st.caption("Brak przeszłych wydarzeń.")
-            else:
-                # Selectbox bez "cap ..." w etykiecie
-                def _fmtp(i):
-                    dt = pd.to_datetime(df_all.loc[df_all["id"]==i, "starts_at"].values[0]).strftime("%d.%m.%Y %H:%M")
-                    nm = df_all.loc[df_all["id"]==i, "name"].values[0]
-                    return f"{dt} · {nm}" if pd.notna(nm) and str(nm).strip() else dt
-                pickp = st.selectbox("Wybierz wydarzenie", list(past["id"])[::-1], format_func=_fmtp)
-                past_event_view(int(pickp), uid, duration_minutes, mod, blik_phone)
-
-    elif section == "Ustawienia grupy" and mod:
-        st.subheader("Dane podstawowe")
-        with st.form("grp_settings_main"):
-            c1, c2, c3 = st.columns(3)
-            new_name = c1.text_input("Nazwa grupy", value=name)
-            new_city = c2.text_input("Miejscowość", value=city)
-            new_postal = c3.text_input("Kod pocztowy", value=(postal_code or ""))
-            c4, c5, c6 = st.columns(3)
-            new_venue = c4.text_input("Miejsce wydarzenia", value=venue)
-            new_weekday = c5.selectbox("Dzień tygodnia", list(range(7)),
-                                       index=int(weekday),
-                                       format_func=lambda i: ["Pon","Wt","Śr","Czw","Pt","Sob","Nd"][i])
-            new_start = c6.text_input("Godzina bazowa (HH:MM)", value=start_time)
-            c7, c8, c9 = st.columns(3)
-            new_duration = c7.number_input("Czas gry / zajęć (min)", min_value=30, max_value=240, step=5, value=int(duration_minutes))
-            new_price_zl = c8.number_input("Cena (zł)", min_value=0.0, step=1.0, value=price_cents/100)
-            new_blik = c9.text_input("Numer BLIK/telefon", value=blik_phone)
-            c10, c11, _ = st.columns(3)
-            new_sport = c10.selectbox("Dyscyplina/Zajęcia", ALL_DISCIPLINES, index=ALL_DISCIPLINES.index(sport) if sport in ALL_DISCIPLINES else 0)
-            new_default_cap = c11.number_input("Domyślny limit miejsc (0=bez)", min_value=0, step=1, value=int(default_capacity or 0))
-            save_grp = st.form_submit_button("Zapisz ustawienia")
-        if save_grp:
-            try:
-                with engine.begin() as conn:
-                    conn.execute(
-                        update(groups).where(groups.c.id == gid).values(
-                            name=new_name.strip(),
-                            city=new_city.strip(),
-                            postal_code=(new_postal.strip() or None),
-                            venue=new_venue.strip(),
-                            weekday=int(new_weekday),
-                            start_time=new_start.strip(),
-                            duration_minutes=int(new_duration),
-                            price_cents=int(round(new_price_zl*100)),
-                            blik_phone=new_blik.strip(),
-                            sport=new_sport.strip(),
-                            default_capacity=(int(new_default_cap) if new_default_cap>0 else None),
-                        )
-                    )
-                st.success("Zapisano ustawienia grupy.")
-                st.cache_data.clear()
-                st.rerun()
-            except Exception as e:
-                st.error(f"Nie udało się zapisać: {e}")
-
-        st.markdown("---")
-        st.subheader("Dodaj pojedyncze wydarzenie")
-        with st.form("add_event"):
-            c1, c2, c3 = st.columns(3)
-            date_str = c1.date_input("Data", value=pd.Timestamp.now().date())
-            time_str = c2.text_input("Godzina (HH:MM)", value=start_time or "21:00")
-            ev_name = c3.text_input("Nazwa (opcjonalnie)", value="")
-            c4, c5, c6 = st.columns(3)
-            price_zl = c4.number_input("Cena (zł)", min_value=0.0, step=1.0, value=price_cents/100)
-            capacity_ev = c5.number_input("Limit miejsc (0 = bez limitu)", min_value=0, step=1, value=int(default_capacity or 0))
-            add_ev = c6.form_submit_button("Dodaj wydarzenie")
-        if add_ev:
-            try:
-                h, m = map(int, time_str.split(":"))
-                starts_at = datetime.combine(date_str, dt_time(hour=h, minute=m))
-                with engine.begin() as conn:
-                    conn.execute(
-                        insert(events).values(
-                            group_id=gid,
-                            starts_at=starts_at,
-                            price_cents=int(round(price_zl*100)),
-                            capacity=(int(capacity_ev) if capacity_ev>0 else None),
-                            generated=False,
-                            name=(ev_name.strip() or None)
-                        )
-                    )
-                st.success("Dodano wydarzenie.")
-                st.cache_data.clear()
-            except Exception as e:
-                st.error(f"Nie udało się dodać wydarzenia: {e}")
-
-        st.markdown("---")
-        # NOWA SEKCJA: wiele wydarzeń w jednym dniu (checkboxy godzin)
-        st.subheader("Dodaj wiele wydarzeń w jednym dniu")
-        with st.form("add_multi_events"):
-            c1, c2 = st.columns([1,2])
-            mass_date = c1.date_input("Data", value=pd.Timestamp.now().date(), key="multi_date")
-            ev_mass_name = c2.text_input("Nazwa (wspólna dla slotów — opcjonalnie)", key="multi_name", placeholder="np. Trening / Sparing")
-            st.caption("Wybierz godziny (checkboxy):")
-            # siatka checkboxów 24h
+            mass_date = st.sidebar.date_input("Data", value=pd.Timestamp.now().date(), key="sb_multi_date")
+            ev_mass_name = st.sidebar.text_input("Nazwa (opcjonalnie)", key="sb_multi_name", placeholder="np. Trening / Sparing")
+            st.sidebar.caption("Zaznacz godziny:")
             hours = [f"{h:02d}:00" for h in range(24)]
             selected_hours: List[str] = []
-            grid_cols = st.columns(6)
+            # siatka checkboxów w 4 kolumnach (ładnie w sidebarze)
+            cols = st.sidebar.columns(4)
             for idx, hh in enumerate(hours):
-                col = grid_cols[idx % 6]
-                if col.checkbox(hh, key=f"chk_{hh}"):
+                if cols[idx % 4].checkbox(hh, key=f"sb_chk_{hh}"):
                     selected_hours.append(hh)
-            c3, c4 = st.columns([1,3])
-            price_mass = c3.number_input("Cena (zł)", min_value=0.0, step=1.0, value=price_cents/100, key="multi_price")
-            cap_mass = c4.number_input("Limit miejsc (0 = bez limitu)", min_value=0, step=1, value=int(default_capacity or 0), key="multi_cap")
-            add_multi_btn = st.form_submit_button("Dodaj wybrane")
-        if add_multi_btn:
-            if not selected_hours:
-                st.warning("Zaznacz przynajmniej jedną godzinę.")
-            else:
-                try:
-                    with engine.begin() as conn:
-                        for hhmm in sorted(set(selected_hours)):
-                            h, m = map(int, hhmm.split(":"))
-                            starts_at = datetime.combine(mass_date, dt_time(hour=h, minute=m))
-                            conn.execute(
-                                insert(events).values(
-                                    group_id=gid,
-                                    starts_at=starts_at,
-                                    price_cents=int(round(price_mass*100)),
-                                    capacity=(int(cap_mass) if cap_mass>0 else None),
-                                    generated=False,
-                                    name=(ev_mass_name.strip() or None)
-                                )
-                            )
-                    st.success(f"Dodano {len(set(selected_hours))} wydarzeń w dniu {mass_date.strftime('%d.%m.%Y')}.")
-                    st.cache_data.clear()
-                except Exception as e:
-                    st.error(f"Nie udało się dodać wielu wydarzeń: {e}")
-
-        st.markdown("---")
-        st.subheader("Lista wydarzeń (edycja / usuwanie)")
-        df_all = cached_events_df(gid, DB_SCHEMA)
-        if df_all.empty:
-            st.caption("Brak wydarzeń.")
-        else:
-            for row in df_all.itertuples():
-                with st.container(border=True):
-                    cols = st.columns([2.2, 1.3, 1.3, 1, 0.8, 0.8])
-                    dt_old = pd.to_datetime(row.starts_at)
-                    # Bez "cap ..." w nazwie bloku (zostawiamy osobne pole z pojemnością)
-                    cols[0].markdown(f"**{dt_old.strftime('%d.%m.%Y %H:%M')}**" + (f" · {row.name}" if pd.notna(row.name) and str(row.name).strip() else ""))
-                    with cols[1].form(f"edit_ev_{row.id}", clear_on_submit=False):
-                        new_date = st.date_input("Data", value=dt_old.date(), key=f"d_{row.id}")
-                        new_time = st.text_input("Godzina HH:MM", value=dt_old.strftime("%H:%M"), key=f"t_{row.id}")
-                        new_name = st.text_input("Nazwa", value=(row.name or ""), key=f"n_{row.id}")
-                        new_price = st.number_input("Cena (zł)", min_value=0.0, step=1.0, value=row.price_cents/100, key=f"p_{row.id}")
-                        new_cap = st.number_input("Limit (0=bez)", min_value=0, step=1, value=int(row.capacity or 0), key=f"c_{row.id}")
-                        save = st.form_submit_button("Zapisz")
-                    lock_btn = cols[2].button("Zablokuj" if not row.locked else "Odblokuj", key=f"lock_{row.id}")
-                    del_btn = cols[3].button("Usuń", key=f"del_{row.id}")
-                    gen_lbl = "autogen" if row.generated else "ręczne"
-                    cols[4].caption(gen_lbl)
-                    # usuwamy podpis "cap: X" z końca — zostaje tylko edytowalne pole w formularzu
-                    cols[5].caption(f"{'limit' if row.capacity else '—'}")
-
-                    if save:
-                        try:
-                            hh, mm = map(int, new_time.split(":"))
-                            new_dt = datetime.combine(new_date, dt_time(hour=hh, minute=mm))
-                            with engine.begin() as conn:
-                                conn.execute(
-                                    update(events).where(events.c.id == int(row.id)).values(
-                                        starts_at=new_dt,
-                                        name=(new_name.strip() or None),
-                                        price_cents=int(round(new_price*100)),
-                                        capacity=(int(new_cap) if new_cap>0 else None),
-                                    )
-                                )
-                            st.success("Zaktualizowano wydarzenie.")
-                            st.cache_data.clear()
-                        except Exception as e:
-                            st.error(f"Nie udało się zapisać: {e}")
-
-                    if lock_btn:
-                        with engine.begin() as conn:
-                            conn.execute(update(events).where(events.c.id == int(row.id)).values(locked=(not row.locked)))
-                        st.success("Zmieniono blokadę wydarzenia.")
-                        st.cache_data.clear()
-
-                    if del_btn:
-                        try:
-                            with engine.begin() as conn:
-                                conn.execute(text(f"DELETE FROM {T('events')} WHERE id=:i"), {"i": int(row.id)})
-                            st.success("Usunięto wydarzenie.")
-                            st.cache_data.clear()
-                        except Exception as e:
-                            st.error(f"Nie udało się usunąć: {e}")
-
-        st.markdown("---")
-        st.subheader("Generator zdarzeń")
-        if st.button("Wygeneruj 12 kolejnych wydarzeń (bazowy slot)"):
-            upsert_events_for_group(gid, 12)
-            st.success("Dodano brakujące wydarzenia.")
-            st.cache_data.clear()
-
-        with st.expander("🛑 Usuń grupę (nieodwracalne)"):
-            st.warning("Usunięcie grupy skasuje **wszystko** w tej grupie.")
-            confirm_name = st.text_input("Przepisz nazwę grupy, aby potwierdzić:", key="del_confirm")
-            colA, colB = st.columns([1,3])
-            if colA.button("Usuń grupę", type="primary", use_container_width=True):
-                if confirm_name.strip() != name:
-                    st.error("Nazwa nie pasuje.")
-                else:
-                    try:
-                        delete_group(gid)
-                        st.success("Grupa usunięta.")
-                        st.session_state.pop("selected_group_id", None)
-                        st.session_state["go_groups"] = True
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Nie udało się usunąć grupy: {e}")
-
-    else:
-        st.info("Tu później ranking i wykresy. Teraz priorytet: zapisy, płatności, gole/asysty.")
-
-# ---------------------------
-# TOPBAR + localStorage (na zawsze)
-# ---------------------------
-def _inject_username_to_local_storage(name: str):
-    """Zapisuje nazwę do localStorage po stronie przeglądarki (UI only)."""
-    safe_name = (name or "").replace("\\", "\\\\").replace("`", "\\`")
-    st_html(
-        f"""
-        <script>
-        try {{
-          localStorage.setItem("ui.username", JSON.stringify("{safe_name}"));
-          window.dispatchEvent(new StorageEvent('storage', {{
-            key: 'ui.username', newValue: JSON.stringify("{safe_name}")
-          }}));
-        }} catch (e) {{}}
-        </script>
-        """,
-        height=0,
-    )
-
-def render_topbar():
-    """Renderuje górny pasek z informacją o zalogowanym użytkowniku.
-       Priorytet: session_state, a następnie localStorage (na zawsze)."""
-    st.markdown(
-        """
-        <style>
-        .topbar-user {
-            padding: .5rem .75rem;
-            background: #f6f6ff;
-            border: 1px solid #e3e3ff;
-            border-radius: .5rem;
-            font-weight: 600;
-            display: inline-block;
-            margin-bottom: .5rem;
-        }
-        </style>
-        <div id="login-banner" class="topbar-user">Sprawdzam stan logowania…</div>
-        """,
-        unsafe_allow_html=True
-    )
-    # Ustal treść z session_state i z localStorage
-    ss_name = st.session_state.get("user_name", "")
-    ss_text = f"Zalogowano jako: {ss_name}" if ss_name else "Niezalogowany"
-
-    st_html(
-        f"""
-        <script>
-        (function() {{
-          const el = window.parent.document.getElementById("login-banner") || document.getElementById("login-banner");
-          function setText(t) {{ if (el) el.textContent = t; }}
-          // SessionState (z backendu) — wstawiamy od razu
-          setText("{ss_text}".replaceAll("&amp;","&"));
-          // localStorage fallback/persist
-          try {{
-            const v = JSON.parse(localStorage.getItem("ui.username") || "null");
-            if (v && !"{ss_name}".trim()) {{
-               setText("Zalogowano jako: " + v);
-            }}
-          }} catch(e) {{}}
-          // Nasłuch aktualizacji (np. po logowaniu)
-          window.addEventListener("storage", (e) => {{
-            if (e.key === "ui.username" && e.newValue) {{
-              try {{
-                const name = JSON.parse(e.newValue);
-                setText("Zalogowano jako: " + name);
-              }} catch(_) {{}}
-            }}
-          }});
-        }})();
-        </script>
-        """,
-        height=0,
-    )
-
-# ---------------------------
-# Main
-# ---------------------------
-def main():
-    st.set_page_config("Sport Manager", layout="wide")
-    init_db()
-
-    if st.session_state.get("go_panel"):
-        st.session_state["go_panel"] = False
-        st.session_state["nav"] = "Panel grupy"
-    if st.session_state.get("go_groups"):
-        st.session_state["go_groups"] = False
-        st.session_state["nav"] = "Grupy"
-
-    # Sidebar tylko auth (bez stałego "Zalogowano jako ...")
-    sidebar_auth_only()
-
-    page = st.sidebar.radio("Nawigacja", ["Grupy", "Panel grupy"], key="nav", label_visibility="collapsed")
-
-    if page == "Grupy":
-        page_groups()
-    else:
-        gid = st.session_state.get("selected_group_id")
-        if not gid:
-            render_topbar()
-            st.info("Wybierz grupę z listy (Grupy) lub dołącz do jednej.")
-            return
-        page_group_dashboard(int(gid))
-
-if __name__ == "__main__":
-    main()
+            price_mass = st.sidebar.number_input("Cena (zł)", min_value=0.0, step=1.0, value=def_price_zl, key="sb_multi_price")
+            cap
