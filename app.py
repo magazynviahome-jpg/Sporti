@@ -72,7 +72,7 @@ def build_in_clause(name: str, values: List[str]) -> Tuple[str, Dict[str, str]]:
     Zwraca: (tekst_klauzuli, dict paramów)
     """
     keys = [f":{name}{i}" for i in range(len(values))]
-    clause = "(" + ", ".join(keys) + ")" if keys else "(NULL)"  # pusta lista -> zawsze false: IN (NULL)
+    clause = "(" + ", ".join(keys) + ")" if keys else "(NULL)"
     params = {f"{name}{i}": v for i, v in enumerate(values)}
     return clause, params
 
@@ -144,8 +144,7 @@ groups = Table(
     Column("start_time", String(5), nullable=False),
     Column("price_cents", Integer, nullable=False),
     Column("duration_minutes", Integer, nullable=False, server_default=text("60")),
-    Column("blik_phone", String(64), nullable=False,
-           server_default=text("''")),
+    Column("blik_phone", String(64), nullable=False, server_default=text("''")),
     Column("sport", String(64), nullable=False,
            server_default=text("'Piłka nożna (Hala)'") if IS_PG else text("Piłka nożna (Hala)")),
     Column("postal_code", String(16), nullable=True),
@@ -230,13 +229,9 @@ goals = Table(
 def init_db():
     metadata.create_all(engine)
     with engine.begin() as conn:
-        # Kolumny i indeksy
         conn.exec_driver_sql(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 60;")
         conn.exec_driver_sql(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS blik_phone TEXT NOT NULL DEFAULT '';")
-        if IS_PG:
-            conn.exec_driver_sql(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS sport TEXT NOT NULL DEFAULT 'Piłka nożna (Hala)';")
-        else:
-            conn.exec_driver_sql(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS sport TEXT NOT NULL DEFAULT 'Piłka nożna (Hala)';")
+        conn.exec_driver_sql(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS sport TEXT NOT NULL DEFAULT 'Piłka nożna (Hala)';")
         conn.exec_driver_sql(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS postal_code TEXT;")
         conn.exec_driver_sql(f"ALTER TABLE {T('memberships')} ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'member';")
         conn.exec_driver_sql(f"ALTER TABLE {T('events')} ADD COLUMN IF NOT EXISTS name TEXT;")
@@ -370,8 +365,8 @@ def cached_signups_with_payments(event_id: int, schema: str) -> pd.DataFrame:
     return pd.read_sql_query(
         f"""
         SELECT es.user_id, u.name,
-               COALESCE(p.user_marked_paid, false) AS user_marked_paid,
-               COALESCE(p.moderator_confirmed, false) AS moderator_confirmed
+               COALESCE(p.user_marked_paid, 0) AS user_marked_paid,
+               COALESCE(p.moderator_confirmed, 0) AS moderator_confirmed
         FROM {T('event_signups')} es
         JOIN {T('users')} u ON u.id=es.user_id
         LEFT JOIN {T('payments')} p ON p.event_id=es.event_id AND p.user_id=es.user_id
@@ -420,7 +415,7 @@ def user_has_unpaid_past(user_id: int, group_id: int) -> bool:
           WHERE es.user_id=:u
             AND e.group_id=:g
             AND e.starts_at < {NOW_SQL()}
-            AND COALESCE(p.user_marked_paid, false) = false
+            AND COALESCE(p.user_marked_paid, 0) = 0
         ) AS has_debt
         """
         return bool(conn.exec_driver_sql(sql, {"u": int(user_id), "g": int(group_id)}).scalar_one())
@@ -447,7 +442,6 @@ def ensure_user(name: str, phone: str = "") -> int:
             res = conn.execute(
                 insert(users).values(name=name, phone=norm_phone)
             )
-            # portable PK pobrany bez RETURNING
             uid = int(res.inserted_primary_key[0])
             return uid
 
@@ -829,14 +823,15 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
                     cols[0].markdown(f"**Gol #{row.id}** — {row.scorer_name or '—'} (asysta: {row.assist_name or '—'})")
                     with cols[1].form(f"edit_goal_{row.id}", clear_on_submit=False):
                         # strzelec
+                        user_options_sorted = user_options
                         sc_idx = 0
-                        for i, (_, u) in enumerate(user_options):
+                        for i, (_, u) in enumerate(user_options_sorted):
                             if u == row.scorer_id:
                                 sc_idx = i
                                 break
-                        sc_sel = st.selectbox("Strzelec", user_options, index=sc_idx, key=f"edit_sc_{row.id}")
+                        sc_sel = st.selectbox("Strzelec", user_options_sorted, index=sc_idx, key=f"edit_sc_{row.id}")
                         # asysta
-                        as_opts = [("— brak —", None)] + user_options
+                        as_opts = [("— brak —", None)] + user_options_sorted
                         as_idx = 0
                         for i,(label,uidx) in enumerate(as_opts):
                             if uidx == row.assist_id:
@@ -874,7 +869,7 @@ def sidebar_auth_and_filters():
 
     # Logowanie / rejestracja — telefon wymagany (działa jako "hasło")
     name = st.sidebar.text_input("Imię / nick")
-    phone_raw = st.sidebar.text_input("Telefon (wymagany, działa jako hasło)")
+    phone_raw = st.sidebar.text_input("Telefon (wymagany – pełni rolę hasła)", type="password")
 
     login = st.sidebar.button("Zaloguj / Rejestruj")
 
@@ -885,7 +880,7 @@ def sidebar_auth_and_filters():
             st.sidebar.error("Telefon w nieprawidłowym formacie (dozwolone: + i 9–15 cyfr).")
         else:
             phone = phone_raw.strip().replace(" ", "").replace("-", "")
-            # sprawdź czy istnieje user o takim imieniu
+            # sprawdź czy istnieje user o tej nazwie
             with engine.begin() as conn:
                 row = conn.execute(
                     select(users.c.id, users.c.phone).where(users.c.name == name.strip())
@@ -1011,40 +1006,55 @@ def page_groups():
                 else:
                     c[4].caption("Zaloguj się, aby wejść")
 
-    # Utwórz nową grupę
+    # Utwórz nową grupę — 3 wiersze × 3 kolumny, kolejne sekcje od lewej
     st.markdown("---")
     with st.expander("➕ Utwórz nową grupę", expanded=False):
         with st.form("create_group_form", clear_on_submit=False):
-            col1, col2, col3 = st.columns([1.4,1,1])
-            # Typ i dyscyplina
-            activity_type_f = col1.selectbox("Typ aktywności", ["Sporty drużynowe", "Zajęcia fitness"])
+            st.markdown("### Dane grupy")
+
+            # ROW 1
+            r1c1, r1c2, r1c3 = st.columns(3)
+            name = r1c1.text_input("Nazwa grupy")
+            city = r1c2.text_input("Miejscowość")
+            postal_code = r1c3.text_input("Kod pocztowy (np. 00-001)")
+
+            # ROW 2
+            r2c1, r2c2, r2c3 = st.columns(3)
+            venue = r2c1.text_input("Miejsce wydarzenia (hala/boisko/plaża)")
+            weekday = r2c2.selectbox(
+                "Dzień tygodnia", list(range(7)),
+                format_func=lambda i: ["Pon","Wt","Śr","Czw","Pt","Sob","Nd"][i]
+            )
+            start_time = r2c3.text_input("Godzina bazowa (HH:MM)", value="21:00")
+
+            # ROW 3
+            r3c1, r3c2, r3c3 = st.columns(3)
+            duration_minutes = r3c1.number_input("Czas gry / zajęć (min)", min_value=30, max_value=240, step=15, value=60)
+            price = r3c2.number_input("Cena za obiekt/zajęcia (zł)", min_value=0.0, step=1.0)
+            blik = r3c3.text_input("Numer BLIK/telefon do płatności")
+
+            # ROW 4 (kolejny wiersz od lewej)
+            st.markdown("### Typ aktywności")
+            r4c1, r4c2, r4c3 = st.columns(3)
+            activity_type_f = r4c1.selectbox("Typ aktywności", ["Sporty drużynowe", "Zajęcia fitness"])
             if activity_type_f == "Sporty drużynowe":
-                sport_sel = col1.selectbox("Dyscyplina", TEAM_SPORTS, index=0)
+                sport_sel = r4c2.selectbox("Dyscyplina", TEAM_SPORTS, index=0)
             else:
-                sport_sel = col1.selectbox("Zajęcia", FITNESS_CLASSES, index=0)
+                sport_sel = r4c2.selectbox("Zajęcia", FITNESS_CLASSES, index=0)
 
-            name = col1.text_input("Nazwa grupy")
-            city = col2.text_input("Miejscowość")
-            postal_code = col2.text_input("Kod pocztowy (np. 00-001)")
-            venue = col2.text_input("Miejsce wydarzenia (hala/boisko/plaża)")
-
-            weekday = col3.selectbox("Dzień tygodnia", list(range(7)),
-                                     format_func=lambda i: ["Pon","Wt","Śr","Czw","Pt","Sob","Nd"][i])
-            start_time = col3.text_input("Godzina bazowa (HH:MM)", value="21:00")
-            duration_minutes = col3.number_input("Czas gry / zajęć (min)", min_value=30, max_value=240, step=15, value=60)
-            price = col3.number_input("Cena za obiekt/zajęcia (zł)", min_value=0.0, step=1.0)
-            blik = col3.text_input("Numer BLIK/telefon do płatności")
-
-            st.markdown(
-                "#### Dodatkowe zajęcia w tym dniu (opcjonalnie)\n"
+            # ROW 5 (kolejny wiersz od lewej) — dodatkowe sloty
+            st.markdown("### Dodatkowe sloty (opcjonalnie)")
+            st.caption(
                 "Wpisz **po jednej** linii w formacie: `HH:MM;Nazwa`  \n"
                 "Przykład:\n"
                 "`09:00;Pilates`\n"
                 "`12:00;Joga`"
             )
-            extra_raw = st.text_area("Lista slotów (godzina;nazwa)", height=120, key="extra_slots")
+            r5c1, r5c2, r5c3 = st.columns(3)
+            extra_raw = r5c1.text_area("Lista slotów (godzina;nazwa)", height=120, key="extra_slots")
 
             submitted = st.form_submit_button("Utwórz grupę")
+
         if submitted:
             if "user_id" not in st.session_state:
                 st.error("Zaloguj się, aby tworzyć grupy.")
@@ -1056,7 +1066,7 @@ def page_groups():
                 # parse extra slots
                 slots: List[Tuple[str, Optional[str]]] = []
                 slots.append((start_time.strip(), None))  # bazowy slot
-                if extra_raw.strip():
+                if extra_raw and extra_raw.strip():
                     for line in extra_raw.strip().splitlines():
                         if ";" in line:
                             hhmm, nm = line.split(";", 1)
