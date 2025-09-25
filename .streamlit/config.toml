@@ -1,0 +1,6 @@
+[theme]
+primaryColor = "#7C3AED"            # fiolet (violet-600)
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F3FF" # jasny fiolet tła kart
+textColor = "#1F1B2E"
+font = "sans serif"
