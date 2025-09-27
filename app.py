@@ -1,9 +1,6 @@
 # app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/SQLite)
-# Wersja: 2025-09-27 (cookie auth + 7d upcoming + slots autogen + teams/goals + stats W/D/L)
-# Zmiany w tej wersji:
-# - Statystyki: dodano "Remisy" (draws) obok Wygrane/Przegrane
-# - Zabezpieczenie przed wypisaniem DeltaGenerator (komponenty HTML nie są zwracane/drukowane)
-# - Pozostałe funkcje jak w poprzedniej wersji
+# Wersja: 2025-09-27 — cookie auth (bez utcnow), wylogowanie działa, sloty=>eventy 30 dni, W/R/P w statystykach,
+# brak DeltaGenerator w UI, brak SettingWithCopyWarning, poprawione tabelki
 
 import os
 import re
@@ -58,7 +55,7 @@ BASE_URL = _get_secret("BASE_URL", "http://localhost:8501")
 
 REQUIRE_JOIN_APPROVAL = (_get_secret("REQUIRE_JOIN_APPROVAL", "true").strip().lower() in ("1","true","yes","y"))
 GEN_HORIZON_DAYS = int(_get_secret("GEN_HORIZON_DAYS", "30") or "30")
-SECRET_KEY = _get_secret("SECRET_KEY", "dev-secret-change-me")  # JWT podpis
+SECRET_KEY = _get_secret("SECRET_KEY", "dev-secret-change-me")
 COOKIE_NAME = _get_secret("COOKIE_NAME", "sm_auth")
 COOKIE_MAX_DAYS = int(_get_secret("COOKIE_MAX_DAYS", "7") or "7")
 
@@ -169,7 +166,7 @@ def verify_password(password: str, salt_hex: str, key_hex: str, meta: str) -> bo
     return hmac.compare_digest(calc, expected)
 
 # ---------------------------
-# JWT + Cookie helpers (bez zwracania DeltaGenerator)
+# JWT + Cookie helpers
 # ---------------------------
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
@@ -193,14 +190,16 @@ def _jwt_verify(token: str, key: str) -> Optional[dict]:
         if not hmac.compare_digest(_b64url(mac), s):
             return None
         payload = json.loads(_unb64url(p))
-        if "exp" in payload and datetime.utcnow().timestamp() > float(payload["exp"]):
+        # Uwaga: używamy timezone-aware czasu
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if "exp" in payload and now_ts > float(payload["exp"]):
             return None
         return payload
     except Exception:
         return None
 
 def _components_html_silent(html: str, height: int = 0):
-    # Nie zwraca obiektu DG — nic nie wypisze
+    # Nie zwracamy obiektu DG — nic nie wyświetli jego repr()
     components.html(html, height=height)
 
 def _write_cookie_and_url(token: str, max_days: int):
@@ -262,16 +261,21 @@ def _session_login(uid: int, name: str, email: str, remember_days: int = COOKIE_
     st.session_state["user_id"] = uid
     st.session_state["user_name"] = name
     st.session_state["user_email"] = email
-    exp = (datetime.utcnow() + timedelta(days=remember_days)).timestamp()
+    exp = (datetime.now(timezone.utc) + timedelta(days=remember_days)).timestamp()
     token = _jwt_sign({"uid": uid, "name": name, "email": email, "exp": exp}, SECRET_KEY)
     _write_cookie_and_url(token, remember_days)
 
 def _session_logout():
+    # flaga na jedną klatkę, by pominąć auto-login z URL/cookie
+    st.session_state["just_logged_out"] = True
     for k in ["user_id","user_name","user_email","selected_group_id","selected_event_id","nav","go_panel","go_groups",
               "activity_type","discipline","city_filter","postal_filter","login_attempts"]:
         st.session_state.pop(k, None)
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
     _clear_cookie_and_url()
-    st.stop()
 
 def _try_auto_login_from_auth_param():
     if "user_id" in st.session_state:
@@ -736,7 +740,7 @@ def user_has_unpaid_past(user_id: int, group_id: int) -> bool:
         return bool(conn.execute(text(sql), {"u": int(user_id), "g": int(group_id)}).scalar_one())
 
 # ---------------------------
-# Mutacje i logika domenowa (użytkownicy / grupy / sloty / zapisy / płatności / drużyny / gole)
+# Mutacje i logika domenowa
 # ---------------------------
 def ensure_user_with_password(name: str, email: str, password: str) -> int:
     if not validate_email(email):
@@ -1185,16 +1189,14 @@ def participants_table(group_id: int, event_id: int, show_pay=False):
     if "name" not in df.columns:
         df["name"] = df["user_id"].astype(str)
 
-    view_cols = ["name", "Statystyki"]
+    view_cols = ["Uczestnik", "Statystyki"]
+    out = df.rename(columns={"name": "Uczestnik"})[["Uczestnik", "Statystyki"]].copy()
     if show_pay:
-        df["Zapłacone"] = df["user_marked_paid"].astype(bool)
-        df["Potwierdzone (mod)"] = df["moderator_confirmed"].astype(bool)
+        out["Zapłacone"] = df["user_marked_paid"].astype(bool).values
+        out["Potwierdzone (mod)"] = df["moderator_confirmed"].astype(bool).values
         view_cols += ["Zapłacone", "Potwierdzone (mod)"]
 
-    st.dataframe(
-        df.rename(columns={"name": "Uczestnik"})[["Uczestnik"] + [c for c in view_cols if c != "name"]],
-        hide_index=True, use_container_width=True
-    )
+    st.dataframe(out[view_cols], hide_index=True, use_container_width=True)
 
 def team_builder(event_id: int, uid: int, is_mod: bool):
     if not is_mod:
@@ -1395,12 +1397,11 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
         participants_table(int(e.group_id), event_id, show_pay=True)
 
 # ---------------------------
-# Statystyki (zakładka) — z Wygrane/Remisy/Przegrane
+# Statystyki (W/R/P + remisy)
 # ---------------------------
 def page_stats(group_id: int):
     st.subheader("Statystyki grupy")
     with engine.begin() as conn:
-        # wystąpienia
         played = pd.read_sql_query(
             text(f"""
             SELECT u.id AS user_id, u.name, COUNT(es.event_id) AS appearances
@@ -1413,7 +1414,6 @@ def page_stats(group_id: int):
             ORDER BY appearances DESC, u.name
             """), conn, params={"g": int(group_id)}
         )
-        # gole/asysty
         ga = pd.read_sql_query(
             text(f"""
             SELECT u.id AS user_id, u.name,
@@ -1427,7 +1427,6 @@ def page_stats(group_id: int):
             GROUP BY u.id, u.name
             """), conn, params={"g": int(group_id)}
         )
-        # W/D/L
         wl = pd.read_sql_query(
             text(f"""
             WITH my_team AS (
@@ -1464,18 +1463,17 @@ def page_stats(group_id: int):
             df[c] = df[c].fillna(0).astype(int)
         else:
             df[c] = 0
-    st.dataframe(
-        df.rename(columns={
-            "name":"Zawodnik",
-            "appearances":"Wystąpienia",
-            "goals":"Gole",
-            "assists":"Asysty",
-            "wins":"Wygrane",
-            "draws":"Remisy",
-            "losses":"Przegrane"
-        })[["Zawodnik","Wystąpienia","Gole","Asysty","Wygrane","Remisy","Przegrane"]],
-        hide_index=True, use_container_width=True
-    )
+    out = df.rename(columns={
+        "name":"Zawodnik",
+        "appearances":"Wystąpienia",
+        "goals":"Gole",
+        "assists":"Asysty",
+        "wins":"Wygrane",
+        "draws":"Remisy",
+        "losses":"Przegrane"
+    })[["Zawodnik","Wystąpienia","Gole","Asysty","Wygrane","Remisy","Przegrane"]].copy()
+
+    st.dataframe(out, hide_index=True, use_container_width=True)
 
 # ---------------------------
 # AUTH UI (sidebar)
@@ -1528,7 +1526,7 @@ def sidebar_auth_only():
                     st.sidebar.error(f"Nie udało się zmienić hasła: {e}")
         st.sidebar.markdown("---")
 
-    # Po zalogowaniu — tylko Wyloguj
+    # Po zalogowaniu — tylko Wyloguj (obok statusu)
     if "user_id" in st.session_state:
         col1, col2 = st.sidebar.columns(2)
         col1.caption("")
@@ -1876,7 +1874,7 @@ def page_group_dashboard(group_id: int):
             st.info("Brak wydarzeń")
         else:
             now = pd.Timestamp.now()
-            past = df_all[df_all["starts_at"] < now]
+            past = df_all[df_all["starts_at"] < now].copy()
             if past.empty:
                 st.caption("Brak przeszłych wydarzeń.")
             else:
@@ -2066,8 +2064,13 @@ def page_group_dashboard(group_id: int):
 # ---------------------------
 def main():
     st.set_page_config("Sport Manager", layout="wide")
-    _ensure_auth_param_from_cookie()
-    _try_auto_login_from_auth_param()
+
+    # Po wylogowaniu pomijamy auto-login przez jedną klatkę
+    if not st.session_state.get("just_logged_out", False):
+        _ensure_auth_param_from_cookie()
+        _try_auto_login_from_auth_param()
+    else:
+        st.session_state["just_logged_out"] = False
 
     init_db()
 
