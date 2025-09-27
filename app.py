@@ -37,7 +37,6 @@ from sqlalchemy.engine import Engine
 
 # --- Compact Bottom Navigation (footer) — light theme, sidebar hidden ---
 def render_bottom_nav(active: str):
-    import streamlit as st
     # Global CSS: hide sidebar + footer nav styles
     st.markdown("""
     <style>
@@ -2146,7 +2145,6 @@ def page_group_dashboard(group_id: int):
 # ---------------------------
 
 def _app_main_impl():
-    import streamlit as st
 def main():
     tab = (getattr(st, 'query_params', {}) or {}).get('tab', ['home'])[0] if hasattr(st, 'query_params') else st.experimental_get_query_params().get('tab', ['home'])[0]
     render_bottom_nav(tab)
