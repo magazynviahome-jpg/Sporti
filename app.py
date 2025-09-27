@@ -1,4 +1,82 @@
 # app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/SQLite)
+
+# === SAFETY PATCH: zapobiegaj wyświetlaniu repr() DeltaGenerator w UI ===
+try:
+    import streamlit as _st_patch
+    from types import FunctionType as _FuncT
+    try:
+        # DeltaGenerator class (opcjonalnie, nie wszędzie jest eksportowana wprost)
+        from streamlit.delta_generator import DeltaGenerator as _DG
+    except Exception:
+        _DG = tuple()  # brak klasy — użyjemy heurystyki po nazwie
+
+    def _is_dg(obj):
+        try:
+            # sprawdzenie po klasie albo nazwie klasy
+            return (_DG and isinstance(obj, _DG)) or (obj.__class__.__name__ == "DeltaGenerator")
+        except Exception:
+            return False
+
+    def _sanitize_msg(msg):
+        # Dopuszczalne prymitywy
+        if isinstance(msg, (str, int, float, bool)):
+            return msg
+        # DeltaGenerator => nie pokaż repr, zamień na krótki komunikat
+        if _is_dg(msg):
+            return "⚠️ Wewnętrzny obiekt UI (DeltaGenerator) — komunikat zastępczy."
+        # próba konwersji na str (np. wyjątki)
+        try:
+            s = str(msg)
+        except Exception:
+            s = "⚠️ (obiekt nieprzedstawialny)"
+        # Jeśli str wygląda jak repr DeltaGenerator, podmień
+        if "DeltaGenerator(" in s or "delta_type" in s and "add_rows_metadata" in s:
+            return "⚠️ Wewnętrzny obiekt UI — komunikat zastępczy."
+        return s
+
+    # Owiń alerty: warning/info/error/success
+    def _wrap_alert(fn):
+        def _inner(msg, *a, **k):
+            msg = _sanitize_msg(msg)
+            return fn(msg, *a, **k)
+        return _inner
+
+    for _name in ("warning", "info", "error", "success"):
+        if hasattr(_st_patch, _name):
+            setattr(_st_patch, _name, _wrap_alert(getattr(_st_patch, _name)))
+
+    # Owiń st.write — ignoruj czyste DeltaGeneratory przekazane do wypisania
+    if hasattr(_st_patch, "write"):
+        _orig_write = _st_patch.write
+        def _safe_write(*args, **kwargs):
+            safe_args = []
+            for x in args:
+                if _is_dg(x):
+                    # Nie zapisuj DG do strumienia — to generuje ten długi zrzut
+                    continue
+                safe_args.append(x)
+            if not safe_args and not kwargs:
+                # gdy przekazano tylko DG — nic nie wypisuj
+                return None
+            return _orig_write(*safe_args, **kwargs)
+        _st_patch.write = _safe_write
+
+    # Wycisz help()/st.help(), żeby nie renderowały tablic metod w UI
+    import builtins as _bi
+    if hasattr(_bi, "help"):
+        def _noop_help(*a, **k):
+            return None
+        _bi.help = _noop_help
+    if hasattr(_st_patch, "help"):
+        def _noop_st_help(*a, **k):
+            return None
+        _st_patch.help = _noop_st_help
+
+except Exception as _e_patch:
+    # Nie blokuj aplikacji, jeśli patch nie zadziała
+    pass
+# === /SAFETY PATCH ===
+
 # Wersja: 2025-09-27 — cookie auth (bez utcnow), wylogowanie działa, sloty=>eventy 30 dni, W/R/P w statystykach,
 # brak DeltaGenerator w UI, brak SettingWithCopyWarning, poprawione tabelki
 
