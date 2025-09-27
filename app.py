@@ -2140,6 +2140,20 @@ def page_group_dashboard(group_id: int):
 # ---------------------------
 # Main
 # ---------------------------
-def main():
+
+def _app_main_impl():
     import streamlit as st
     st.set_page_config(page_title='Sport Manager', layout='wide')
+
+
+
+def main():
+    import streamlit as st
+    try:
+        st.caption("🚀 main() start")
+        _app_main_impl()
+        st.caption("✅ main() done")
+    except Exception as e:
+        st.error("❌ Błąd w main() — szczegóły poniżej:")
+        st.exception(e)
+
