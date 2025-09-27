@@ -19,6 +19,73 @@ from typing import List, Optional, Tuple, Dict
 
 import pandas as pd
 import streamlit as st
+# === NO-DG HOTFIX (inserts wrappers around Streamlit rendering) ===
+try:
+    import streamlit as _st_fix
+    try:
+        from streamlit.delta_generator import DeltaGenerator as _DG
+    except Exception:
+        _DG = None
+
+    def _is_dg(obj):
+        if _DG is not None:
+            try:
+                return isinstance(obj, _DG)
+            except Exception:
+                pass
+        try:
+            return obj.__class__.__name__ == "DeltaGenerator"
+        except Exception:
+            return False
+
+    def _dg_sanitize(x):
+        # Leave primitives and strings
+        if isinstance(x, (str, int, float, bool)) or x is None:
+            return x
+        # Suppress DGs
+        if _is_dg(x):
+            return "⚠️ (wewnętrzny obiekt UI — pominięto)"
+        # Convert safely to string, but hide DG-like reprs
+        try:
+            s = str(x)
+        except Exception:
+            s = "(obiekt nieprzedstawialny)"
+        if "DeltaGenerator(" in s and "delta_type" in s:
+            return "⚠️ (wewnętrzny obiekt UI — pominięto)"
+        return s
+
+    # Wrap selected Streamlit functions
+    def _wrap_single_arg(fn):
+        def _inner(msg, *a, **k):
+            return fn(_dg_sanitize(msg), *a, **k)
+        return _inner
+
+    def _wrap_varargs(fn):
+        def _inner(*args, **kwargs):
+            safe = [v for v in (_dg_sanitize(x) for x in args) if not _is_dg(v)]
+            if not safe and not kwargs:
+                return None
+            return fn(*safe, **kwargs)
+        return _inner
+
+    for _name in ("warning", "info", "error", "success", "exception"):
+        if hasattr(_st_fix, _name):
+            setattr(_st_fix, _name, _wrap_single_arg(getattr(_st_fix, _name)))
+
+    if hasattr(_st_fix, "write"):
+        _st_fix.write = _wrap_varargs(getattr(_st_fix, "write"))
+
+    # Silence help() dumps entirely
+    import builtins as _bi
+    if hasattr(_bi, "help"):
+        _bi.help = lambda *a, **k: None
+    if hasattr(_st_fix, "help"):
+        _st_fix.help = lambda *a, **k: None
+
+except Exception:
+    pass
+# === /NO-DG HOTFIX ===
+
 import streamlit.components.v1 as components
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Integer, String,
@@ -26,123 +93,6 @@ from sqlalchemy import (
     insert, update, and_, text
 )
 from sqlalchemy.engine import Engine
-
-# === UI PATCH (light only): Hide sidebar and polish ===
-import streamlit as _st_css_only
-_st_css_only.markdown('''
-<style>
-section[data-testid="stSidebar"] { display:none !important; }
-div[data-testid="collapsedControl"] { display:none !important; }
-:root, .stApp { background: #FFFFFF; }
-.block-container { padding-top: 0.5rem; padding-bottom: 2rem; }
-.topbar {
-  position: sticky; top: 0; z-index: 999;
-  backdrop-filter: saturate(150%) blur(6px);
-  background: rgba(255,255,255,0.85);
-  border-bottom: 1px solid #E5E7EB;
-  padding: 8px 0;
-}
-.pill { border: 1px solid #E5E7EB; border-radius: 999px; padding: 6px 12px;
-        margin-right: 6px; cursor: pointer; font-weight: 600; color: #475569; }
-.pill.active { background: #2563EB; color: #fff; border-color: #2563EB; }
-.btn-primary { background: #2563EB; color: #fff; border-radius: 10px; padding: 8px 12px;
-               border: 1px solid #1D4ED8; font-weight: 600; }
-.btn-ghost { background: transparent; color: #0F172A; border-radius: 10px; padding: 8px 12px;
-             border: 1px solid #E5E7EB; font-weight: 600; }
-header[data-testid="stHeader"] { background: transparent; }
-</style>
-''', unsafe_allow_html=True)
-# === /UI PATCH ===
-
-
-def _render_topbar():
-    import streamlit as st
-    from datetime import datetime
-
-    st.markdown('<div class="topbar"></div>', unsafe_allow_html=True)
-    with st.container():
-        left, center, right = st.columns([1.2, 2, 1.3], gap="large")
-        with left:
-            c1, c2 = st.columns([0.24, 0.76])
-            with c1:
-                st.markdown("🟢")
-            with c2:
-                st.markdown("### **Sport Manager**")
-        with center:
-            # Fallback for segmented_control -> radio horizontal when not available
-            if hasattr(st, "segmented_control"):
-                mode = st.segmented_control("", ["Twoje Grupy", "Szukaj grupy"], key="ui_view_mode", default="Twoje Grupy")
-            else:
-                mode = st.radio("",
-                                ["Twoje Grupy", "Szukaj grupy"],
-                                key="ui_view_mode",
-                                index=0,
-                                horizontal=True,
-                                label_visibility="collapsed")
-            if mode == "Twoje Grupy":
-                st.session_state["nav"] = st.session_state.get("nav", "Grupy")
-            else:
-                st.session_state["nav"] = "Szukaj grupy"
-            if mode == "Szukaj grupy":
-                qcol, fcol = st.columns([4,1])
-                with qcol:
-                    st.text_input("Szukaj grupy", key="search_query", label_visibility="collapsed",
-                                  placeholder="Nazwa, miasto, dyscyplina…")
-                with fcol:
-                    if hasattr(st, "popover"):
-                        st.popover("Filtry").write("Tu dodamy filtry: Dyscyplina, Miasto, Daty")
-                    else:
-                        with st.expander("Filtry"):
-                            st.write("Tu dodamy filtry: Dyscyplina, Miasto, Daty")
-        with right:
-            n1, n2, n3 = st.columns([0.5, 1.2, 1.2])
-            with n1:
-                st.button("🔔", key="notif_bell", help="Powiadomienia")
-            with n2:
-                if st.button("+ Nowe wydarzenie", key="btn_new_event"):
-                    st.session_state["ui_show_new_event"] = True
-            with n3:
-                if st.button("+ Utwórz grupę", key="btn_new_group"):
-                    st.session_state["ui_show_new_group"] = True
-            st.write("")
-            avcol1, avcol2 = st.columns([0.2, 0.8])
-            with avcol1:
-                st.markdown("🙂")
-            with avcol2:
-                mc1, mc2, mc3 = st.columns(3)
-                with mc1:
-                    st.button("Profil", key="btn_profile")
-                with mc2:
-                    st.button("Ustawienia", key="btn_settings")
-                with mc3:
-                    if st.button("Wyloguj", key="btn_logout"):
-                        if "_session_logout" in globals():
-                            try:
-                                globals()["_session_logout"]()
-                            except Exception:
-                                pass
-                        st.rerun()
-
-    if st.session_state.get("ui_show_new_event"):
-        with st.expander("Nowe wydarzenie", expanded=True):
-            st.write("Tu wpinamy istniejącą logikę tworzenia wydarzeń (formularz).")
-            c1, c2 = st.columns(2)
-            with c1:
-                st.button("Utwórz", key="new_event_confirm")
-            with c2:
-                if st.button("Anuluj", key="new_event_cancel"):
-                    st.session_state["ui_show_new_event"] = False
-    if st.session_state.get("ui_show_new_group"):
-        with st.expander("Utwórz grupę", expanded=True):
-            st.write("Tu wpinamy istniejącą logikę tworzenia grupy (formularz).")
-            c1, c2 = st.columns(2)
-            with c1:
-                st.button("Utwórz", key="new_group_confirm")
-            with c2:
-                if st.button("Anuluj", key="new_group_cancel"):
-                    st.session_state["ui_show_new_group"] = False
-
-
 
 # ---------------------------
 # Sekrety / ENV
@@ -2180,7 +2130,6 @@ def page_group_dashboard(group_id: int):
 # Main
 # ---------------------------
 def main():
-    _render_topbar()
     st.set_page_config("Sport Manager", layout="wide")
 
     # Po wylogowaniu pomijamy auto-login przez jedną klatkę
