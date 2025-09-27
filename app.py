@@ -1,11 +1,12 @@
 # app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/SQLite)
 # Ostatnie zmiany:
-# - "Wyloguj" obok "Zaloguj" w sekcji Logowanie
-# - Lista wydarzeń (edycja): tylko Godzina, Nazwa, Ilość miejsc; "Zapisz" obok "Usuń"; bez etykiet "ręczne"/"limit"
-# - Usunięto heder "Grupy" w widoku listy
-# - "Wszystkie grupy" pokazuje się dopiero po ustawieniu filtrów; dynamiczny tytuł (np. "Wszystkie grupy — Kęty · Piłka nożna (Hala)")
-# - Fix: PG booleany (FALSE/TRUE), SettingWithCopyWarning (.copy()/.loc), dodane pole 'generated' w cached_events_df
-# - Fix: syntax error w tabeli goals (ForeignKey(FK("events"), ondelete="CASCADE"))
+# - Prośby o dołączenie z akceptacją admina (join_requests) + flaga REQUIRE_JOIN_APPROVAL
+# - UI: „Wyloguj” obok „Zaloguj”; filtry przeniesione do sidebara; brak nagłówka „Grupy”
+# - „Wszystkie grupy” pojawiają się dopiero po ustawieniu filtrów; lista ograniczona filtrem (np. Kęty + Piłka nożna)
+# - Harmonogram „stałych wydarzeń” (group_slots) z edycją w jednym wierszu: Godzina | Nazwa | Ilość miejsc | [Zapisz zmiany] [Usuń]
+# - Generator wydarzeń korzysta z harmonogramu
+# - Fix: bool w Postgres (INSERT/COALESCE), SettingWithCopyWarning, kolumna generated w cached_events_df
+# - Zapis na wydarzenie wymaga członkostwa (gdy włączone wymaganie akceptacji)
 
 import os
 import re
@@ -53,7 +54,10 @@ SMTP_PORT = int(_get_secret("SMTP_PORT", "465") or "465")
 SMTP_USERNAME = _get_secret("SMTP_USERNAME", "")
 SMTP_PASSWORD = _get_secret("SMTP_PASSWORD", "")
 SMTP_FROM = _get_secret("SMTP_FROM", SMTP_USERNAME or "no-reply@example.com")
-BASE_URL = _get_secret("BASE_URL", "http://localhost:8501")  # do linków resetu
+BASE_URL = _get_secret("BASE_URL", "http://localhost:8501")
+
+# Flaga: czy wymagamy akceptacji admina do dołączenia do grupy
+REQUIRE_JOIN_APPROVAL = (_get_secret("REQUIRE_JOIN_APPROVAL", "true").strip().lower() in ("1","true","yes","y"))
 
 # ---------------------------
 # DB Engine
@@ -109,7 +113,6 @@ TEAM_SPORTS = [
     "Siatkówka plażowa",
     "Piłka nożna plażowa",
 ]
-
 FITNESS_CLASSES = [
     "Fitness: Cross",
     "Fitness: Trening obwodowy",
@@ -120,9 +123,7 @@ FITNESS_CLASSES = [
     "Fitness: HIIT",
     "Fitness: Indoor Cycling",
 ]
-
 ALL_DISCIPLINES = TEAM_SPORTS + FITNESS_CLASSES
-
 def is_team_sport(sport_name: str) -> bool:
     return sport_name in TEAM_SPORTS
 
@@ -150,11 +151,7 @@ SCRYPT_KEY_LEN = 32
 def hash_password(password: str) -> Tuple[str, str, str]:
     salt = os.urandom(SCRYPT_SALT_LEN)
     key = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=SCRYPT_KEY_LEN)
-    return (
-        binascii.hexlify(salt).decode(),
-        binascii.hexlify(key).decode(),
-        f"scrypt${SCRYPT_N}${SCRYPT_R}${SCRYPT_P}${SCRYPT_KEY_LEN}",
-    )
+    return (binascii.hexlify(salt).decode(), binascii.hexlify(key).decode(), f"scrypt${SCRYPT_N}${SCRYPT_R}${SCRYPT_P}${SCRYPT_KEY_LEN}")
 
 def verify_password(password: str, salt_hex: str, key_hex: str, meta: str) -> bool:
     try:
@@ -183,7 +180,6 @@ users = Table(
     sqlite_autoincrement=True,
     schema=DB_SCHEMA if IS_PG else None,
 )
-
 password_resets = Table(
     "password_resets", metadata,
     Column("id", Integer, primary_key=True),
@@ -194,7 +190,6 @@ password_resets = Table(
     sqlite_autoincrement=True,
     schema=DB_SCHEMA if IS_PG else None,
 )
-
 groups = Table(
     "groups", metadata,
     Column("id", Integer, primary_key=True),
@@ -213,7 +208,6 @@ groups = Table(
     sqlite_autoincrement=True,
     schema=DB_SCHEMA if IS_PG else None,
 )
-
 memberships = Table(
     "memberships", metadata,
     Column("user_id", Integer, ForeignKey(FK("users"), ondelete="CASCADE"), primary_key=True),
@@ -221,7 +215,6 @@ memberships = Table(
     Column("role", String(16), nullable=False, server_default=text("'member'") if IS_PG else text("member")),
     schema=DB_SCHEMA if IS_PG else None,
 )
-
 events = Table(
     "events", metadata,
     Column("id", Integer, primary_key=True),
@@ -235,7 +228,6 @@ events = Table(
     sqlite_autoincrement=True,
     schema=DB_SCHEMA if IS_PG else None,
 )
-
 event_signups = Table(
     "event_signups", metadata,
     Column("event_id", Integer, ForeignKey(FK("events"), ondelete="CASCADE"), primary_key=True),
@@ -243,7 +235,6 @@ event_signups = Table(
     Column("signed_at", DateTime, nullable=False),
     schema=DB_SCHEMA if IS_PG else None,
 )
-
 payments = Table(
     "payments", metadata,
     Column("event_id", Integer, ForeignKey(FK("events"), ondelete="CASCADE"), primary_key=True),
@@ -252,7 +243,6 @@ payments = Table(
     Column("moderator_confirmed", Boolean, nullable=False, server_default=text("false") if IS_PG else text("0")),
     schema=DB_SCHEMA if IS_PG else None,
 )
-
 teams = Table(
     "teams", metadata,
     Column("id", Integer, primary_key=True),
@@ -264,14 +254,12 @@ teams = Table(
     sqlite_autoincrement=True,
     schema=DB_SCHEMA if IS_PG else None,
 )
-
 team_members = Table(
     "team_members", metadata,
     Column("team_id", Integer, ForeignKey(FK("teams"), ondelete="CASCADE"), primary_key=True),
     Column("user_id", Integer, ForeignKey(FK("users"), ondelete="CASCADE"), primary_key=True),
     schema=DB_SCHEMA if IS_PG else None,
 )
-
 goals = Table(
     "goals", metadata,
     Column("id", Integer, primary_key=True),
@@ -279,6 +267,35 @@ goals = Table(
     Column("scorer_id", Integer, ForeignKey(FK("users"), ondelete="SET NULL"), nullable=False),
     Column("assist_id", Integer, ForeignKey(FK("users"), ondelete="SET NULL")),
     Column("minute", Integer),
+    sqlite_autoincrement=True,
+    schema=DB_SCHEMA if IS_PG else None,
+)
+
+# NOWA TABELA: stałe sloty grupy (harmonogram)
+group_slots = Table(
+    "group_slots", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("group_id", Integer, ForeignKey(FK("groups"), ondelete="CASCADE"), nullable=False),
+    Column("weekday", Integer, nullable=False),       # 0..6
+    Column("start_time", String(5), nullable=False),  # "HH:MM"
+    Column("name", String(255), nullable=True),       # np. Joga, Pilates
+    Column("capacity", Integer, nullable=True),       # nadpisanie limitu (opcjonalne)
+    UniqueConstraint("group_id", "weekday", "start_time", name="uq_group_slots_unique"),
+    sqlite_autoincrement=True,
+    schema=DB_SCHEMA if IS_PG else None,
+)
+
+# NOWA TABELA: prośby o dołączenie
+join_requests = Table(
+    "join_requests", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("group_id", Integer, ForeignKey(FK("groups"), ondelete="CASCADE"), nullable=False),
+    Column("user_id", Integer, ForeignKey(FK("users"), ondelete="CASCADE"), nullable=False),
+    Column("message", String(2000)),
+    Column("status", String(16), nullable=False, server_default=text("'pending'") if not IS_PG else text("'pending'")),
+    Column("created_at", DateTime, nullable=False),
+    Column("decided_at", DateTime, nullable=True),
+    UniqueConstraint("group_id", "user_id", name="uq_join_requests"),
     sqlite_autoincrement=True,
     schema=DB_SCHEMA if IS_PG else None,
 )
@@ -299,22 +316,30 @@ def init_db():
             conn.execute(text(f"CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email ON {T('users')} (email)"))
         else:
             conn.execute(text(f"CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email ON {T('users')}(email)"))
-        # groups
+
+        # groups — nowe kolumny (idempotentnie)
         conn.execute(text(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 60;"))
         conn.execute(text(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS blik_phone TEXT NOT NULL DEFAULT '';"))
         conn.execute(text(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS sport TEXT NOT NULL DEFAULT 'Piłka nożna (Hala)';"))
         conn.execute(text(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS postal_code TEXT;"))
         conn.execute(text(f"ALTER TABLE {T('groups')} ADD COLUMN IF NOT EXISTS default_capacity INTEGER;"))
+
         # memberships/events
         conn.execute(text(f"ALTER TABLE {T('memberships')} ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'member';"))
         conn.execute(text(f"ALTER TABLE {T('events')} ADD COLUMN IF NOT EXISTS name TEXT;"))
         conn.execute(text(f"ALTER TABLE {T('events')} ADD COLUMN IF NOT EXISTS capacity INTEGER;"))
+
         # indeksy
         conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_events_group_starts ON {T('events')} (group_id, starts_at);"))
         conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_signups_event ON {T('event_signups')} (event_id);"))
         conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_payments_event_user ON {T('payments')} (event_id, user_id);"))
         conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_goals_event_scorer ON {T('goals')} (event_id, scorer_id);"))
         conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_goals_event_assist ON {T('goals')} (event_id, assist_id);"))
+
+        # indices dla nowych tabel
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_group_slots_group ON {T('group_slots')} (group_id);"))
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_join_requests_group ON {T('join_requests')} (group_id);"))
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_join_requests_user ON {T('join_requests')} (user_id);"))
 
 # ---------------------------
 # Utils
@@ -370,11 +395,7 @@ def create_reset_token_for_user(user_id: int, minutes_valid: int = 15) -> str:
     token = secrets.token_urlsafe(32)
     expires = (datetime.now(timezone.utc) + timedelta(minutes=minutes_valid)).replace(tzinfo=None)
     with engine.begin() as conn:
-        conn.execute(
-            insert(password_resets).values(
-                user_id=int(user_id), token=token, expires_at=expires, used=False
-            )
-        )
+        conn.execute(insert(password_resets).values(user_id=int(user_id), token=token, expires_at=expires, used=False))
     return token
 
 def consume_reset_token(token: str) -> Optional[int]:
@@ -388,9 +409,7 @@ def consume_reset_token(token: str) -> Optional[int]:
         now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
         if row.expires_at < now_utc_naive:
             return None
-        conn.execute(
-            update(password_resets).where(password_resets.c.id == int(row.id)).values(used=True)
-        )
+        conn.execute(update(password_resets).where(password_resets.c.id == int(row.id)).values(used=True))
         return int(row.user_id)
 
 # ---------------------------
@@ -522,21 +541,34 @@ def cached_signups_with_payments(event_id: int, schema: str) -> pd.DataFrame:
     return pd.read_sql_query(text(sql), engine, params={"eid": int(event_id)})
 
 @st.cache_data(ttl=20)
-def cached_event_goals(event_id: int, schema: str) -> pd.DataFrame:
-    return pd.read_sql_query(
-        text(
-        f"""
-        SELECT g.id, g.event_id, g.scorer_id, s.name AS scorer_name,
-               g.assist_id, a.name AS assist_name,
-               g.minute
-        FROM {T('goals')} g
-        LEFT JOIN {T('users')} s ON s.id=g.scorer_id
-        LEFT JOIN {T('users')} a ON a.id=g.assist_id
-        WHERE g.event_id=:eid
-        ORDER BY COALESCE(g.minute,9999), g.id
-        """),
-        engine, params={"eid": int(event_id)}
-    )
+def cached_group_slots(group_id: int) -> pd.DataFrame:
+    sql = f"""
+    SELECT id, group_id, weekday, start_time, name, capacity
+    FROM {T('group_slots')}
+    WHERE group_id=:g
+    ORDER BY weekday, start_time
+    """
+    return pd.read_sql_query(text(sql), engine, params={"g": int(group_id)})
+
+@st.cache_data(ttl=20)
+def cached_join_status(user_id: int, group_id: int) -> Optional[str]:
+    # Zwraca 'pending'/'approved'/'rejected' lub None
+    sql = f"SELECT status FROM {T('join_requests')} WHERE user_id=:u AND group_id=:g"
+    row = pd.read_sql_query(text(sql), engine, params={"u": int(user_id), "g": int(group_id)})
+    if row.empty:
+        return None
+    return str(row.iloc[0]["status"])
+
+@st.cache_data(ttl=20)
+def cached_pending_requests(group_id: int) -> pd.DataFrame:
+    sql = f"""
+    SELECT jr.id, jr.user_id, u.name, u.email, jr.message, jr.created_at
+    FROM {T('join_requests')} jr
+    JOIN {T('users')} u ON u.id=jr.user_id
+    WHERE jr.group_id=:g AND jr.status='pending'
+    ORDER BY jr.created_at
+    """
+    return pd.read_sql_query(text(sql), engine, params={"g": int(group_id)})
 
 # ---------------------------
 # Role / zaległości
@@ -581,7 +613,7 @@ def user_has_unpaid_past(user_id: int, group_id: int) -> bool:
         return bool(conn.execute(text(sql), {"u": int(user_id), "g": int(group_id)}).scalar_one())
 
 # ---------------------------
-# Mutacje
+# Mutacje — grupy / harmonogram / prośby o dołączenie / zapisy
 # ---------------------------
 def ensure_user_with_password(name: str, email: str, password: str) -> int:
     if not validate_email(email):
@@ -589,9 +621,7 @@ def ensure_user_with_password(name: str, email: str, password: str) -> int:
     weak = validate_password_strength(password)
     if weak:
         raise ValueError(weak)
-
     salt_hex, key_hex, meta = hash_password(password)
-
     with engine.begin() as conn:
         exists = conn.execute(select(users.c.id).where(users.c.email == email.strip().lower())).first()
         if exists:
@@ -615,17 +645,12 @@ def update_user_password(user_id: int, new_password: str):
         raise ValueError(weak)
     salt_hex, key_hex, meta = hash_password(new_password)
     with engine.begin() as conn:
-        conn.execute(
-            update(users).where(users.c.id == int(user_id)).values(
-                pwd_salt=salt_hex, pwd_hash=key_hex, pwd_meta=meta
-            )
-        )
+        conn.execute(update(users).where(users.c.id == int(user_id)).values(pwd_salt=salt_hex, pwd_hash=key_hex, pwd_meta=meta))
 
 def _insert_membership(conn, user_id: int, group_id: int, role: str):
     if IS_PG:
         conn.execute(
-            text(
-            f"""
+            text(f"""
             INSERT INTO {T('memberships')} (user_id, group_id, role)
             VALUES (:u, :g, :r)
             ON CONFLICT (user_id, group_id) DO NOTHING;
@@ -634,21 +659,17 @@ def _insert_membership(conn, user_id: int, group_id: int, role: str):
         )
     else:
         conn.execute(
-            text(
-            f"""
+            text(f"""
             INSERT OR IGNORE INTO {T('memberships')} (user_id, group_id, role)
             VALUES (:u, :g, :r);
             """),
             {"u": int(user_id), "g": int(group_id), "r": role},
         )
 
-def join_group(user_id: int, group_id: int):
-    with engine.begin() as conn:
-        _insert_membership(conn, int(user_id), int(group_id), "member")
-
 def create_group(name: str, city: str, venue: str, weekday: int, start_time: str,
                  price_cents: int, blik_phone: str, created_by: int, duration_minutes: int = 60,
-                 sport: str = "Piłka nożna (Hala)", postal_code: str = "", default_capacity: Optional[int] = None) -> int:
+                 sport: str = "Piłka nożna (Hala)", postal_code: str = "",
+                 default_capacity: Optional[int] = None) -> int:
     with engine.begin() as conn:
         res = conn.execute(
             insert(groups).values(
@@ -660,20 +681,37 @@ def create_group(name: str, city: str, venue: str, weekday: int, start_time: str
         )
         gid = int(res.inserted_primary_key[0])
         _insert_membership(conn, int(created_by), int(gid), "moderator")
+        # bazowy slot
+        conn.execute(
+            insert(group_slots).values(
+                group_id=gid, weekday=int(weekday), start_time=start_time, name=None,
+                capacity=(int(default_capacity) if default_capacity else None)
+            )
+        )
         return gid
 
 def delete_group(group_id: int):
     with engine.begin() as conn:
         conn.execute(text(f"DELETE FROM {T('groups')} WHERE id=:g"), {"g": int(group_id)})
 
-def create_recurring_events(group_id: int, weekday: int, base_price_cents: int,
-                            slots: List[Tuple[str, Optional[str]]], weeks_ahead: int = 12,
-                            default_capacity: Optional[int] = None):
-    dates = next_dates_for_weekday(date.today(), weekday, weeks_ahead)
+def create_recurring_events_from_slots(group_id: int, weeks_ahead: int = 12):
+    # tworzy przyszłe wydarzenia wg group_slots (nie dubluje istniejących)
     with engine.begin() as conn:
-        for hhmm, ev_name in slots:
-            h, m = map(int, hhmm.split(":"))
-            for d in dates:
+        gr = conn.execute(
+            select(groups.c.price_cents, groups.c.default_capacity).where(groups.c.id == int(group_id))
+        ).first()
+        price_cents = int(gr.price_cents) if gr else 0
+        def_cap = gr.default_capacity if gr and gr.default_capacity is not None else None
+
+        slots = conn.execute(
+            select(group_slots.c.weekday, group_slots.c.start_time, group_slots.c.name, group_slots.c.capacity)
+            .where(group_slots.c.group_id == int(group_id))
+        ).all()
+
+        today = date.today()
+        for s in slots:
+            h, m = map(int, s.start_time.split(":"))
+            for d in next_dates_for_weekday(today, int(s.weekday), weeks_ahead):
                 starts_at = datetime.combine(d, dt_time(hour=h, minute=m))
                 exists = conn.execute(
                     select(events.c.id).where(and_(events.c.group_id == group_id, events.c.starts_at == starts_at))
@@ -683,60 +721,121 @@ def create_recurring_events(group_id: int, weekday: int, base_price_cents: int,
                         insert(events).values(
                             group_id=group_id,
                             starts_at=starts_at,
-                            price_cents=base_price_cents,
-                            capacity=default_capacity,
+                            price_cents=price_cents,
+                            capacity=(int(s.capacity) if s.capacity else (int(def_cap) if def_cap else None)),
                             generated=True,
-                            name=(ev_name.strip() if ev_name else None)
+                            name=(s.name if s.name else None)
                         )
                     )
 
 def upsert_events_for_group(group_id: int, weeks_ahead: int = 12):
-    with engine.begin() as conn:
-        g = conn.execute(
-            select(groups.c.weekday, groups.c.start_time, groups.c.price_cents, groups.c.default_capacity).where(groups.c.id == group_id)
-        ).first()
-    if not g:
-        return
-    create_recurring_events(group_id, int(g.weekday), int(g.price_cents), [(g.start_time, None)], weeks_ahead, g.default_capacity)
+    create_recurring_events_from_slots(group_id, weeks_ahead)
 
 def _event_current_count(conn, event_id: int) -> int:
     return int(conn.execute(text(f"SELECT COUNT(*) FROM {T('event_signups')} WHERE event_id=:e"), {"e": int(event_id)}).scalar_one())
 
+# ----- Prośby o dołączenie -----
+def request_to_join(group_id: int, user_id: int, message: str) -> Tuple[bool, str]:
+    now = datetime.now()
+    with engine.begin() as conn:
+        # już członek?
+        exists_mem = conn.execute(
+            select(memberships.c.user_id).where(and_(memberships.c.user_id == int(user_id), memberships.c.group_id == int(group_id)))
+        ).first()
+        if exists_mem:
+            return False, "Już należysz do tej grupy."
+        # istniejąca prośba?
+        jr = conn.execute(
+            select(join_requests.c.id, join_requests.c.status)
+            .where(and_(join_requests.c.user_id == int(user_id), join_requests.c.group_id == int(group_id)))
+        ).first()
+        if jr:
+            if jr.status == "pending":
+                return False, "Prośba już oczekuje na rozpatrzenie."
+            # jeśli była odrzucona/zaakceptowana — ponowne zgłoszenie ustawia na pending
+            conn.execute(
+                update(join_requests).where(join_requests.c.id == int(jr.id)).values(
+                    message=(message.strip() or None), status="pending", created_at=now, decided_at=None
+                )
+            )
+            return True, "Wysłano ponowną prośbę."
+        # nowa prośba
+        conn.execute(
+            insert(join_requests).values(
+                group_id=int(group_id), user_id=int(user_id), message=(message.strip() or None),
+                status="pending", created_at=now, decided_at=None
+            )
+        )
+    return True, "Prośba wysłana. Czekaj na akceptację."
+
+def approve_request(request_id: int, moderator_id: int) -> Tuple[bool, str]:
+    with engine.begin() as conn:
+        jr = conn.execute(
+            select(join_requests.c.id, join_requests.c.group_id, join_requests.c.user_id, join_requests.c.status)
+            .where(join_requests.c.id == int(request_id))
+        ).first()
+        if not jr:
+            return False, "Prośba nie istnieje."
+        if not is_moderator(moderator_id, int(jr.group_id)):
+            return False, "Brak uprawnień."
+        if jr.status == "approved":
+            return True, "Już zaakceptowano."
+        now = datetime.now()
+        conn.execute(update(join_requests).where(join_requests.c.id == int(jr.id)).values(status="approved", decided_at=now))
+        _insert_membership(conn, int(jr.user_id), int(jr.group_id), "member")
+    return True, "Zaakceptowano prośbę."
+
+def reject_request(request_id: int, moderator_id: int) -> Tuple[bool, str]:
+    with engine.begin() as conn:
+        jr = conn.execute(
+            select(join_requests.c.id, join_requests.c.group_id, join_requests.c.user_id, join_requests.c.status)
+            .where(join_requests.c.id == int(request_id))
+        ).first()
+        if not jr:
+            return False, "Prośba nie istnieje."
+        if not is_moderator(moderator_id, int(jr.group_id)):
+            return False, "Brak uprawnień."
+        if jr.status == "rejected":
+            return True, "Już odrzucono."
+        now = datetime.now()
+        conn.execute(update(join_requests).where(join_requests.c.id == int(jr.id)).values(status="rejected", decided_at=now))
+    return True, "Odrzucono prośbę."
+
+# ----- Zapisy na wydarzenia -----
 def sign_up(event_id: int, user_id: int) -> Tuple[bool, str]:
     now = datetime.now()
     with engine.begin() as conn:
-        cap_row = conn.execute(select(events.c.capacity, events.c.group_id).where(events.c.id == event_id)).first()
-        if not cap_row:
+        ev = conn.execute(select(events.c.capacity, events.c.group_id).where(events.c.id == event_id)).first()
+        if not ev:
             return False, "Wydarzenie nie istnieje."
-        cap = cap_row.capacity
+        gid = int(ev.group_id)
+
+        # jeśli włączone wymaganie — sprawdź członkostwo
+        if REQUIRE_JOIN_APPROVAL:
+            mem = conn.execute(
+                select(memberships.c.user_id).where(and_(memberships.c.user_id == int(user_id), memberships.c.group_id == gid))
+            ).first()
+            if not mem:
+                return False, "Aby się zapisać, najpierw dołącz do grupy (wyślij prośbę)."
+
+        cap = ev.capacity
         if cap is not None:
             cnt = _event_current_count(conn, event_id)
             if cnt >= int(cap):
                 return False, "Brak miejsc na to wydarzenie."
 
+        # zapis
         if IS_PG:
             conn.execute(
-                text(
-                f"""
+                text(f"""
                 INSERT INTO {T('event_signups')} (event_id, user_id, signed_at)
                 VALUES (:e, :u, :t)
                 ON CONFLICT (event_id, user_id) DO NOTHING;
                 """),
                 {"e": int(event_id), "u": int(user_id), "t": now},
             )
-        else:
             conn.execute(
-                text(
-                f"""
-                INSERT OR IGNORE INTO {T('event_signups')} (event_id, user_id, signed_at)
-                VALUES (:e, :u, :t);
-                """),
-                {"e": int(event_id), "u": int(user_id), "t": now},
-            )
-        if IS_PG:
-            conn.execute(
-                text(
-                f"""
+                text(f"""
                 INSERT INTO {T('payments')} (event_id, user_id, user_marked_paid, moderator_confirmed)
                 SELECT :e, :u, FALSE, FALSE
                 WHERE NOT EXISTS (
@@ -747,8 +846,14 @@ def sign_up(event_id: int, user_id: int) -> Tuple[bool, str]:
             )
         else:
             conn.execute(
-                text(
-                f"""
+                text(f"""
+                INSERT OR IGNORE INTO {T('event_signups')} (event_id, user_id, signed_at)
+                VALUES (:e, :u, :t);
+                """),
+                {"e": int(event_id), "u": int(user_id), "t": now},
+            )
+            conn.execute(
+                text(f"""
                 INSERT INTO {T('payments')} (event_id, user_id, user_marked_paid, moderator_confirmed)
                 SELECT :e, :u, 0, 0
                 WHERE NOT EXISTS (
@@ -757,18 +862,6 @@ def sign_up(event_id: int, user_id: int) -> Tuple[bool, str]:
                 """),
                 {"e": int(event_id), "u": int(user_id)},
             )
-
-        # (Na razie) auto-członkostwo przy zapisie — zostanie zmienione, gdy wdrożymy workflow z akceptacją moda
-        conn.execute(
-            text(
-            f"""
-            INSERT OR IGNORE INTO {T('memberships')} (user_id, group_id, role)
-            SELECT :u, e.group_id, 'member'
-            FROM {T('events')} e
-            WHERE e.id=:e;
-            """),
-            {"u": int(user_id), "e": int(event_id)},
-        )
     return True, "Zapisano na wydarzenie."
 
 def withdraw(event_id: int, user_id: int):
@@ -979,7 +1072,7 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
         participants_table(int(e.group_id), event_id, show_pay=True)
 
 # ---------------------------
-# AUTH UI (sidebar) — z przyciskami obok siebie
+# AUTH UI (sidebar) — loguj/wyloguj obok siebie
 # ---------------------------
 def _rate_limit_ok() -> bool:
     key = "login_attempts"
@@ -995,14 +1088,12 @@ def _bump_attempt():
     st.session_state.setdefault(key, []).append(now)
 
 def sidebar_auth_only():
-    # Status logowania
     user_name = st.session_state.get("user_name")
     if user_name:
         st.sidebar.info(f"Zalogowano jako: {user_name}")
     else:
         st.sidebar.info("Niezalogowany")
 
-    # reset hasła przez query param
     qp = st.query_params
     reset_token = qp.get("reset")
     if isinstance(reset_token, list):
@@ -1070,25 +1161,6 @@ def sidebar_auth_only():
                         st.session_state["user_email"] = row.email
                         st.sidebar.success(f"Zalogowano jako: {row.name}")
 
-        with st.sidebar.expander("Nie pamiętam hasła"):
-            reset_email = st.text_input("Twój e-mail", key="reset_email")
-            if st.button("Wyślij link resetu"):
-                try:
-                    with engine.begin() as conn:
-                        u = conn.execute(select(users.c.id, users.c.email, users.c.name).where(users.c.email == (reset_email or "").strip().lower())).first()
-                    if u:
-                        token = create_reset_token_for_user(int(u.id), minutes_valid=15)
-                        link = f"{BASE_URL}?reset={token}"
-                        html = f"""
-                        <p>Cześć {u.name},</p>
-                        <p>Reset hasła do Sport Manager.</p>
-                        <p><a href="{link}">Kliknij, aby ustawić nowe hasło</a> (link ważny 15 minut).</p>
-                        """
-                        send_email(u.email, "Reset hasła — Sport Manager", html, text_body=f"Link (15 min): {link}")
-                    st.success("Jeśli adres istnieje, wysłaliśmy link resetu.")
-                except Exception as e:
-                    st.error(f"Nie udało się wysłać maila: {e}")
-
     else:
         reg_name = st.sidebar.text_input("Imię / nick", key="reg_name")
         reg_email = st.sidebar.text_input("E-mail", key="reg_email")
@@ -1148,8 +1220,7 @@ def sidebar_filters():
 # Strony
 # ---------------------------
 def page_groups():
-    # Usunięto heder "Grupy"
-
+    # bez hedera „Grupy”
     uid = st.session_state.get("user_id")
     activity_type = st.session_state.get("activity_type", "Wszystkie")
     discipline = st.session_state.get("discipline", "Wszystkie")
@@ -1164,7 +1235,6 @@ def page_groups():
         except Exception as e:
             st.error(f"Nie mogę pobrać listy Twoich grup: {e}")
             my_df = pd.DataFrame()
-
         if my_df.empty:
             st.caption("Nie należysz jeszcze do żadnej grupy.")
         else:
@@ -1183,17 +1253,13 @@ def page_groups():
     else:
         st.caption("Zaloguj się, aby zobaczyć swoje grupy.")
 
-    # Wszystkie grupy — tylko gdy ustawiono jakikolwiek filtr
-    filters_active = bool(
-        (activity_type != "Wszystkie") or
-        (city_filter.strip()) or
-        (postal_filter.strip())
-    )
+    # „Wszystkie grupy” — tylko po ustawieniu jakiegoś filtra
+    filters_active = bool((activity_type != "Wszystkie") or (city_filter.strip()) or (postal_filter.strip()))
     if not filters_active:
         st.info("Ustaw filtry w pasku bocznym, aby zobaczyć dostępne grupy.")
         return
 
-    # Dynamiczny tytuł sekcji wyników
+    # nagłówek sekcji filtrowanej
     title_bits = []
     if city_filter.strip():
         title_bits.append(city_filter.strip().title())
@@ -1218,7 +1284,7 @@ def page_groups():
     else:
         for _, g2 in all_df.iterrows():
             with st.container(border=True):
-                c = st.columns([3.4,1.5,1.6,1.8,1.2])
+                c = st.columns([3.0,1.3,1.4,1.6,2.2,1.2])
                 cap_txt2 = f" · Limit: {int(g2['default_capacity'])}" if pd.notna(g2.get("default_capacity")) and g2.get("default_capacity") else ""
                 c[0].markdown(f"• **{g2['name']}** · {g2['sport']}\n\n{g2['city']} ({g2.get('postal_code','') or ''}) — {g2['venue']}{cap_txt2}")
                 c[1].markdown(f"{time_label(int(g2['weekday']), g2['start_time'])}")
@@ -1226,25 +1292,46 @@ def page_groups():
                 c[3].markdown(f"📱 BLIK: **{g2['blik_phone']}**")
                 if uid:
                     if bool(g2["is_member"]):
-                        if c[4].button("Wejdź", key=f"enter_all_{g2['id']}"):
+                        if c[5].button("Wejdź", key=f"enter_all_{g2['id']}"):
                             st.session_state["selected_group_id"] = int(g2['id'])
                             st.session_state["go_panel"] = True
                             st.rerun()
+                        c[4].caption("Jesteś członkiem")
                     else:
-                        if c[4].button("Dołącz", key=f"join_{g2['id']}"):
-                            join_group(int(uid), int(g2['id']))
-                            st.session_state["selected_group_id"] = int(g2['id'])
-                            st.session_state["go_panel"] = True
-                            st.rerun()
+                        # Prośba o dołączenie
+                        existing = cached_join_status(uid, int(g2["id"])) if REQUIRE_JOIN_APPROVAL else None
+                        msg = c[4].text_input("Napisz kilka słów…", key=f"jr_msg_{g2['id']}", label_visibility="collapsed", placeholder="np. gram regularnie, proszę o akceptację")
+                        disabled = False
+                        label = "Wyślij prośbę" if REQUIRE_JOIN_APPROVAL else "Dołącz"
+                        if REQUIRE_JOIN_APPROVAL and existing == "pending":
+                            disabled = True
+                            c[4].caption("Status: oczekuje")
+                        if c[5].button(label, key=f"join_{g2['id']}", disabled=disabled):
+                            try:
+                                if REQUIRE_JOIN_APPROVAL:
+                                    ok, m = request_to_join(int(g2['id']), int(uid), msg or "")
+                                    if ok:
+                                        st.success(m)
+                                    else:
+                                        st.error(m)
+                                else:
+                                    # tryb bez akceptacji (fallback)
+                                    with engine.begin() as conn:
+                                        _insert_membership(conn, int(uid), int(g2['id']), "member")
+                                    st.success("Dołączono do grupy.")
+                                st.cache_data.clear()
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Nie udało się wysłać prośby: {e}")
                 else:
-                    c[4].caption("Zaloguj się, aby wejść")
+                    c[4].caption("Zaloguj się, aby dołączyć")
+                    c[5].caption("")
 
     # Tworzenie grupy
     st.markdown("---")
     with st.expander("➕ Utwórz nową grupę", expanded=False):
         with st.form("create_group_form", clear_on_submit=False):
             st.markdown("### Dane grupy")
-
             r1c1, r1c2, r1c3 = st.columns(3)
             name = r1c1.text_input("Nazwa grupy")
             city = r1c2.text_input("Miejscowość")
@@ -1264,18 +1351,10 @@ def page_groups():
             st.markdown("### Typ aktywności")
             r4c1, r4c2, _ = st.columns(3)
             activity_type_f = r4c1.selectbox("Typ aktywności", ["Sporty drużynowe", "Zajęcia fitness"])
-            if activity_type_f == "Sporty drużynowe":
-                sport_sel = r4c2.selectbox("Dyscyplina", TEAM_SPORTS, index=0)
-            else:
-                sport_sel = r4c2.selectbox("Zajęcia", FITNESS_CLASSES, index=0)
+            sport_sel = r4c2.selectbox("Dyscyplina/Zajęcia", TEAM_SPORTS if activity_type_f=="Sporty drużynowe" else FITNESS_CLASSES, index=0)
 
             r5c1, _, _ = st.columns(3)
             default_capacity = r5c1.number_input("Domyślny limit miejsc (opcjonalnie)", min_value=0, step=1, value=0, help="0 = bez limitu")
-
-            st.markdown("### Dodatkowe sloty (opcjonalnie)")
-            st.caption("Po jednej linii: `HH:MM;Nazwa`. Przykład: `09:00;Pilates`")
-            r6c1, _, _ = st.columns(3)
-            extra_raw = r6c1.text_area("Lista slotów (godzina;nazwa)", height=120, key="extra_slots")
 
             submitted = st.form_submit_button("Utwórz grupę")
 
@@ -1287,18 +1366,6 @@ def page_groups():
             elif ":" not in start_time or len(start_time) != 5:
                 st.error("Podaj **godzinę bazową** w formacie HH:MM (np. 21:00).")
             else:
-                slots: List[Tuple[str, Optional[str]]] = [(start_time.strip(), None)]
-                if extra_raw and extra_raw.strip():
-                    for line in extra_raw.strip().splitlines():
-                        if ";" in line:
-                            hhmm, nm = line.split(";", 1)
-                            hhmm = hhmm.strip(); nm = nm.strip()
-                            if len(hhmm) == 5 and ":" in hhmm and nm:
-                                slots.append((hhmm, nm))
-                        else:
-                            hhmm = line.strip()
-                            if len(hhmm) == 5 and ":" in hhmm:
-                                slots.append((hhmm, None))
                 try:
                     cap_val = int(default_capacity) if default_capacity and int(default_capacity) > 0 else None
                     gid = create_group(
@@ -1308,8 +1375,8 @@ def page_groups():
                         int(st.session_state["user_id"]), int(duration_minutes),
                         sport_sel, postal_code.strip(), cap_val
                     )
-                    create_recurring_events(gid, int(weekday), int(round(price * 100)), slots, weeks_ahead=12, default_capacity=cap_val)
-                    st.success("Grupa i wydarzenia utworzone.")
+                    create_recurring_events_from_slots(gid, weeks_ahead=12)
+                    st.success("Grupa i harmonogram utworzone.")
                     st.cache_data.clear()
                     st.session_state["selected_group_id"] = int(gid)
                     st.session_state["go_panel"] = True
@@ -1344,6 +1411,17 @@ def page_group_dashboard(group_id: int):
     uid = int(uid)
 
     mod = is_moderator(uid, gid)
+
+    # jeśli nie członek i wymagamy akceptacji — nie powinien tu trafić przez UI,
+    # ale na wszelki wypadek pokaż komunikat
+    if REQUIRE_JOIN_APPROVAL and not mod:
+        with engine.begin() as conn:
+            mem = conn.execute(
+                select(memberships.c.user_id).where(and_(memberships.c.user_id == uid, memberships.c.group_id == gid))
+            ).first()
+        if not mem:
+            st.warning("Nie jesteś członkiem tej grupy. Wyślij prośbę o dołączenie na liście grup.")
+            return
 
     tabs = ["Nadchodzące", "Przeszłe", "Statystyki"]
     if mod:
@@ -1431,6 +1509,115 @@ def page_group_dashboard(group_id: int):
                 st.error(f"Nie udało się zapisać: {e}")
 
         st.markdown("---")
+        # ================= Prośby o dołączenie (dla moderatora) =================
+        st.subheader("Prośby o dołączenie")
+        req_df = cached_pending_requests(gid)
+        if req_df.empty:
+            st.caption("Brak oczekujących próśb.")
+        else:
+            for r in req_df.itertuples():
+                with st.container(border=True):
+                    c1, c2 = st.columns([4,2])
+                    c1.markdown(f"**{r.name}** ({r.email})\n\n{r.message or '—'}")
+                    with c2.form(f"jr_{r.id}", clear_on_submit=False):
+                        a, b = st.columns(2)
+                        ok_btn = a.form_submit_button("Akceptuj", use_container_width=True)
+                        rej_btn = b.form_submit_button("Odrzuć", use_container_width=True)
+                    if ok_btn:
+                        ok, msg = approve_request(int(r.id), int(uid))
+                        if ok:
+                            st.success(msg)
+                            st.cache_data.clear()
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                    if rej_btn:
+                        ok, msg = reject_request(int(r.id), int(uid))
+                        if ok:
+                            st.warning(msg)
+                            st.cache_data.clear()
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+        st.markdown("---")
+        # ================= Stałe wydarzenia — harmonogram =================
+        st.subheader("Lista wydarzeń (edycja / usuwanie) — harmonogram stałych slotów")
+        slots_df = cached_group_slots(gid)
+        if slots_df.empty:
+            st.caption("Brak stałych slotów. Dodaj pierwszy poniżej.")
+        else:
+            for r in slots_df.itertuples():
+                with st.container(border=True):
+                    c1, c2 = st.columns([4.5, 1.5])
+                    with c1.form(f"slot_edit_{r.id}", clear_on_submit=False):
+                        f1, f2, f3, f4 = st.columns([1.4, 1.1, 2.2, 1.3])
+                        new_weekday = f1.selectbox("Dzień", list(range(7)), index=int(r.weekday),
+                                                    format_func=lambda i: ["Pon","Wt","Śr","Czw","Pt","Sob","Nd"][i],
+                                                    label_visibility="collapsed")
+                        new_time = f2.text_input("HH:MM", value=r.start_time, label_visibility="collapsed")
+                        new_name = f3.text_input("Nazwa", value=(r.name or ""), label_visibility="collapsed", placeholder="np. Joga")
+                        new_cap = f4.number_input("Ilość miejsc", min_value=0, step=1, value=int(r.capacity or 0), label_visibility="collapsed")
+                        bsave, bdel = st.columns(2)
+                        save_btn = bsave.form_submit_button("Zapisz zmiany", use_container_width=True)
+                        del_btn = bdel.form_submit_button("Usuń", use_container_width=True)
+
+                    if save_btn:
+                        try:
+                            hh, mm = map(int, new_time.split(":"))
+                            assert 0 <= hh <= 23 and 0 <= mm <= 59
+                            with engine.begin() as conn:
+                                conn.execute(
+                                    update(group_slots).where(group_slots.c.id == int(r.id)).values(
+                                        weekday=int(new_weekday),
+                                        start_time=f"{hh:02d}:{mm:02d}",
+                                        name=(new_name.strip() or None),
+                                        capacity=(int(new_cap) if new_cap>0 else None)
+                                    )
+                                )
+                            st.success("Zapisano slot.")
+                            st.cache_data.clear()
+                        except Exception as e:
+                            st.error(f"Nie udało się zapisać slotu: {e}")
+
+                    if del_btn:
+                        try:
+                            with engine.begin() as conn:
+                                conn.execute(text(f"DELETE FROM {T('group_slots')} WHERE id=:i"), {"i": int(r.id)})
+                            st.success("Usunięto slot.")
+                            st.cache_data.clear()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Nie udało się usunąć slotu: {e}")
+
+        with st.expander("➕ Dodaj stały slot", expanded=False):
+            with st.form("add_slot", clear_on_submit=False):
+                f1, f2, f3, f4 = st.columns([1.4, 1.1, 2.2, 1.3])
+                a_weekday = f1.selectbox("Dzień tygodnia", list(range(7)), format_func=lambda i: ["Pon","Wt","Śr","Czw","Pt","Sob","Nd"][i])
+                a_time = f2.text_input("Godzina (HH:MM)", value=start_time or "21:00")
+                a_name = f3.text_input("Nazwa (opcjonalnie)", value="")
+                a_cap = f4.number_input("Limit miejsc (0=bez)", min_value=0, step=1, value=int(default_capacity or 0))
+                add_slot_btn = st.form_submit_button("Dodaj")
+            if add_slot_btn:
+                try:
+                    hh, mm = map(int, a_time.split(":"))
+                    with engine.begin() as conn:
+                        conn.execute(
+                            insert(group_slots).values(
+                                group_id=gid,
+                                weekday=int(a_weekday),
+                                start_time=f"{hh:02d}:{mm:02d}",
+                                name=(a_name.strip() or None),
+                                capacity=(int(a_cap) if a_cap>0 else None)
+                            )
+                        )
+                    st.success("Dodano slot do harmonogramu.")
+                    st.cache_data.clear()
+                except Exception as e:
+                    st.error(f"Nie udało się dodać slotu: {e}")
+
+        st.markdown("---")
+        # Jednorazowe wydarzenie — jak wcześniej
         st.subheader("Dodaj pojedyncze wydarzenie")
         with st.form("add_event"):
             c1, c2, c3 = st.columns(3)
@@ -1462,62 +1649,29 @@ def page_group_dashboard(group_id: int):
                 st.error(f"Nie udało się dodać wydarzenia: {e}")
 
         st.markdown("---")
-        st.subheader("Lista wydarzeń (edycja / usuwanie)")
-        df_all = cached_events_df(gid, DB_SCHEMA)
-        if df_all.empty:
-            st.caption("Brak wydarzeń.")
-        else:
-            for row in df_all.itertuples():
-                with st.container(border=True):
-                    # Kompaktowy 1 wiersz: [data + (nazwa)] | [HH:MM, Nazwa, Ilość] | [Zapisz | Usuń]
-                    cols = st.columns([2.6, 3.6, 1.2])
-                    dt_old = pd.to_datetime(row.starts_at)
-                    left_title = f"**{dt_old.strftime('%d.%m.%Y %H:%M')}**"
-                    if pd.notna(row.name) and str(row.name).strip():
-                        left_title += f" · {row.name}"
-                    cols[0].markdown(left_title)
-
-                    with cols[1].form(f"edit_ev_{row.id}", clear_on_submit=False):
-                        f1, f2, f3 = st.columns([1.0, 2.0, 1.2])
-                        new_time = f1.text_input("HH:MM", value=dt_old.strftime("%H:%M"), key=f"t_{row.id}", label_visibility="collapsed")
-                        new_name = f2.text_input("Nazwa", value=(row.name or ""), key=f"n_{row.id}", label_visibility="collapsed", placeholder="Nazwa")
-                        new_cap = f3.number_input("Ilość miejsc", min_value=0, step=1, value=int(row.capacity or 0), key=f"c_{row.id}", label_visibility="collapsed")
-                        c_s, c_d = st.columns(2)
-                        save = c_s.form_submit_button("Zapisz", use_container_width=True)
-                        delete_in_form = c_d.form_submit_button("Usuń", use_container_width=True)
-
-                    if save:
-                        try:
-                            hh, mm = map(int, new_time.split(":"))
-                            new_dt = datetime.combine(dt_old.date(), dt_time(hour=hh, minute=mm))  # tylko zmiana godziny
-                            with engine.begin() as conn:
-                                conn.execute(
-                                    update(events).where(events.c.id == int(row.id)).values(
-                                        starts_at=new_dt,
-                                        name=(new_name.strip() or None),
-                                        capacity=(int(new_cap) if new_cap>0 else None),
-                                    )
-                                )
-                            st.success("Zaktualizowano wydarzenie.")
-                            st.cache_data.clear()
-                        except Exception as e:
-                            st.error(f"Nie udało się zapisać: {e}")
-
-                    if delete_in_form:
-                        try:
-                            with engine.begin() as conn:
-                                conn.execute(text(f"DELETE FROM {T('events')} WHERE id=:i"), {"i": int(row.id)})
-                            st.success("Usunięto wydarzenie.")
-                            st.cache_data.clear()
-                        except Exception as e:
-                            st.error(f"Nie udało się usunąć: {e}")
+        st.subheader("Generator zdarzeń z harmonogramu")
+        if st.button("Wygeneruj 12 kolejnych tygodni"):
+            upsert_events_for_group(gid, 12)
+            st.success("Dodano brakujące wydarzenia wg harmonogramu.")
+            st.cache_data.clear()
 
         st.markdown("---")
-        st.subheader("Generator zdarzeń")
-        if st.button("Wygeneruj 12 kolejnych wydarzeń (bazowy slot)"):
-            upsert_events_for_group(gid, 12)
-            st.success("Dodano brakujące wydarzenia.")
-            st.cache_data.clear()
+        with st.expander("🛑 Usuń grupę (nieodwracalne)"):
+            st.warning("Usunięcie grupy skasuje **wszystko** w tej grupie.")
+            confirm_name = st.text_input("Przepisz nazwę grupy, aby potwierdzić:", key="del_confirm")
+            colA, colB = st.columns([1,3])
+            if colA.button("Usuń grupę", type="primary", use_container_width=True):
+                if confirm_name.strip() != name:
+                    st.error("Nazwa nie pasuje.")
+                else:
+                    try:
+                        delete_group(gid)
+                        st.success("Grupa usunięta.")
+                        st.session_state.pop("selected_group_id", None)
+                        st.session_state["go_groups"] = True
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Nie udało się usunąć grupy: {e}")
 
     else:
         st.info("Tu później ranking i wykresy. Teraz priorytet: zapisy, płatności, gole/asysty.")
