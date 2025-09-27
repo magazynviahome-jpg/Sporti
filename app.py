@@ -2146,15 +2146,46 @@ def page_group_dashboard(group_id: int):
 
 def _app_main_impl():
 def main():
-    tab = (getattr(st, 'query_params', {}) or {}).get('tab', ['home'])[0] if hasattr(st, 'query_params') else st.experimental_get_query_params().get('tab', ['home'])[0]
-    render_bottom_nav(tab)
-    import streamlit as st
+    # --- dolny pasek (aktywny z ?tab=...) ---
+    tab = (getattr(st, "query_params", {}) or {}).get("tab", ["home"])[0] if hasattr(st, "query_params") else st.experimental_get_query_params().get("tab", ["home"])[0]
     try:
-        st.caption("🚀 main() start")
-        _app_main_impl()
-        st.caption("✅ main() done")
+        render_bottom_nav(tab)
+    except Exception:
+        pass
+
+    # --- nagłówek/status ---
+    st.markdown("### Sport Manager")
+    if st.session_state.get("user_name"):
+        st.caption(f"Zalogowano jako **{st.session_state['user_name']}**")
+    else:
+        st.info("Jesteś niezalogowany.")
+
+    # --- (opcjonalnie) Twoje istniejące UI: logowanie/filtry z sidebara
+    try:
+        if "sidebar_auth_only" in globals():
+            sidebar_auth_only()
+        if "sidebar_filters" in globals():
+            sidebar_filters()
+    except Exception as _e:
+        st.warning(f"Auth/Filtry: {_e}")
+
+    # --- nawigacja w treści (zamiast sidebaru) ---
+    page = st.radio("Nawigacja", ["Grupy", "Panel grupy"], horizontal=True, label_visibility="collapsed")
+
+    # --- routing do Twoich istniejących widoków ---
+    try:
+        if page == "Grupy":
+            if "page_groups" in globals():
+                page_groups()
+            else:
+                st.write("Widok **Grupy** zostanie podłączony tutaj.")
+        else:
+            gid = st.session_state.get("selected_group_id")
+            if "page_group_dashboard" in globals() and gid:
+                page_group_dashboard(int(gid))
+            else:
+                st.write("Wybierz grupę z listy w zakładce **Grupy**.")
     except Exception as e:
-        st.error("❌ Błąd w main() — szczegóły poniżej:")
         st.exception(e)
 
 main()
