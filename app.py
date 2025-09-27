@@ -27,19 +27,14 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine
 
-# === UI PATCH: Hide sidebar, light theme polish, top-bar spacing ===
+# === UI PATCH (light only): Hide sidebar and polish ===
 import streamlit as _st_css_only
 _st_css_only.markdown('''
 <style>
-/* Hide the sidebar and its toggle completely */
 section[data-testid="stSidebar"] { display:none !important; }
 div[data-testid="collapsedControl"] { display:none !important; }
-
-/* Light theme polish for cards and headers */
 :root, .stApp { background: #FFFFFF; }
 .block-container { padding-top: 0.5rem; padding-bottom: 2rem; }
-
-/* Top bar wrapper */
 .topbar {
   position: sticky; top: 0; z-index: 999;
   backdrop-filter: saturate(150%) blur(6px);
@@ -47,30 +42,106 @@ div[data-testid="collapsedControl"] { display:none !important; }
   border-bottom: 1px solid #E5E7EB;
   padding: 8px 0;
 }
-
-/* Pills (segmented control look) */
-.pill {
-  border: 1px solid #E5E7EB; border-radius: 999px;
-  padding: 6px 12px; margin-right: 6px; cursor: pointer;
-  font-weight: 600; color: #475569;
-}
+.pill { border: 1px solid #E5E7EB; border-radius: 999px; padding: 6px 12px;
+        margin-right: 6px; cursor: pointer; font-weight: 600; color: #475569; }
 .pill.active { background: #2563EB; color: #fff; border-color: #2563EB; }
-
-/* Buttons look */
-.btn-primary {
-  background: #2563EB; color: #fff; border-radius: 10px; padding: 8px 12px;
-  border: 1px solid #1D4ED8; font-weight: 600;
-}
-.btn-ghost {
-  background: transparent; color: #0F172A; border-radius: 10px; padding: 8px 12px;
-  border: 1px solid #E5E7EB; font-weight: 600;
-}
-
-/* Reduce excessive gap above first element */
+.btn-primary { background: #2563EB; color: #fff; border-radius: 10px; padding: 8px 12px;
+               border: 1px solid #1D4ED8; font-weight: 600; }
+.btn-ghost { background: transparent; color: #0F172A; border-radius: 10px; padding: 8px 12px;
+             border: 1px solid #E5E7EB; font-weight: 600; }
 header[data-testid="stHeader"] { background: transparent; }
 </style>
 ''', unsafe_allow_html=True)
 # === /UI PATCH ===
+
+
+def _render_topbar():
+    import streamlit as st
+    from datetime import datetime
+
+    st.markdown('<div class="topbar"></div>', unsafe_allow_html=True)
+    with st.container():
+        left, center, right = st.columns([1.2, 2, 1.3], gap="large")
+        with left:
+            c1, c2 = st.columns([0.24, 0.76])
+            with c1:
+                st.markdown("🟢")
+            with c2:
+                st.markdown("### **Sport Manager**")
+        with center:
+            # Fallback for segmented_control -> radio horizontal when not available
+            if hasattr(st, "segmented_control"):
+                mode = st.segmented_control("", ["Twoje Grupy", "Szukaj grupy"], key="ui_view_mode", default="Twoje Grupy")
+            else:
+                mode = st.radio("",
+                                ["Twoje Grupy", "Szukaj grupy"],
+                                key="ui_view_mode",
+                                index=0,
+                                horizontal=True,
+                                label_visibility="collapsed")
+            if mode == "Twoje Grupy":
+                st.session_state["nav"] = st.session_state.get("nav", "Grupy")
+            else:
+                st.session_state["nav"] = "Szukaj grupy"
+            if mode == "Szukaj grupy":
+                qcol, fcol = st.columns([4,1])
+                with qcol:
+                    st.text_input("Szukaj grupy", key="search_query", label_visibility="collapsed",
+                                  placeholder="Nazwa, miasto, dyscyplina…")
+                with fcol:
+                    if hasattr(st, "popover"):
+                        st.popover("Filtry").write("Tu dodamy filtry: Dyscyplina, Miasto, Daty")
+                    else:
+                        with st.expander("Filtry"):
+                            st.write("Tu dodamy filtry: Dyscyplina, Miasto, Daty")
+        with right:
+            n1, n2, n3 = st.columns([0.5, 1.2, 1.2])
+            with n1:
+                st.button("🔔", key="notif_bell", help="Powiadomienia")
+            with n2:
+                if st.button("+ Nowe wydarzenie", key="btn_new_event"):
+                    st.session_state["ui_show_new_event"] = True
+            with n3:
+                if st.button("+ Utwórz grupę", key="btn_new_group"):
+                    st.session_state["ui_show_new_group"] = True
+            st.write("")
+            avcol1, avcol2 = st.columns([0.2, 0.8])
+            with avcol1:
+                st.markdown("🙂")
+            with avcol2:
+                mc1, mc2, mc3 = st.columns(3)
+                with mc1:
+                    st.button("Profil", key="btn_profile")
+                with mc2:
+                    st.button("Ustawienia", key="btn_settings")
+                with mc3:
+                    if st.button("Wyloguj", key="btn_logout"):
+                        if "_session_logout" in globals():
+                            try:
+                                globals()["_session_logout"]()
+                            except Exception:
+                                pass
+                        st.rerun()
+
+    if st.session_state.get("ui_show_new_event"):
+        with st.expander("Nowe wydarzenie", expanded=True):
+            st.write("Tu wpinamy istniejącą logikę tworzenia wydarzeń (formularz).")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.button("Utwórz", key="new_event_confirm")
+            with c2:
+                if st.button("Anuluj", key="new_event_cancel"):
+                    st.session_state["ui_show_new_event"] = False
+    if st.session_state.get("ui_show_new_group"):
+        with st.expander("Utwórz grupę", expanded=True):
+            st.write("Tu wpinamy istniejącą logikę tworzenia grupy (formularz).")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.button("Utwórz", key="new_group_confirm")
+            with c2:
+                if st.button("Anuluj", key="new_group_cancel"):
+                    st.session_state["ui_show_new_group"] = False
+
 
 
 # ---------------------------
@@ -2144,92 +2215,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-def _render_topbar():
-    import streamlit as st
-    from datetime import datetime
-
-    # wrapper for sticky area
-    st.markdown('<div class="topbar"></div>', unsafe_allow_html=True)
-    with st.container():
-        left, center, right = st.columns([1.2, 2, 1.3], gap="large")
-        with left:
-            c1, c2 = st.columns([0.24, 0.76])
-            with c1:
-                st.markdown("🟢")  # placeholder logo (emoji). Replace with image if you have.
-            with c2:
-                st.markdown("### **Sport Manager**")
-                # optional status chip under name (kept minimal)
-                # st.caption("Warszawa • Siatkówka")
-        with center:
-            mode = st.segmented_control(
-                label="",
-                options=["Twoje Grupy", "Szukaj grupy"],
-                key="ui_view_mode",
-                default="Twoje Grupy"
-            )
-            # persist mapping to potential existing router
-            if mode == "Twoje Grupy":
-                st.session_state["nav"] = st.session_state.get("nav", "Grupy")
-            else:
-                st.session_state["nav"] = "Szukaj grupy"
-            # in search mode, render search + filters row
-            if mode == "Szukaj grupy":
-                qcol, fcol = st.columns([4,1])
-                with qcol:
-                    st.text_input("Szukaj grupy", key="search_query", label_visibility="collapsed", placeholder="Nazwa, miasto, dyscyplina…")
-                with fcol:
-                    st.popover("Filtry").write("Tu dodamy filtry: Dyscyplina, Miasto, Daty")
-        with right:
-            n1, n2, n3 = st.columns([0.5, 1.2, 1.2])
-            with n1:
-                # dummy notifications bell; the real counter can read your existing state
-                st.button("🔔", key="notif_bell", help="Powiadomienia")
-            with n2:
-                if st.button("+ Nowe wydarzenie", key="btn_new_event"):
-                    st.session_state["ui_show_new_event"] = True
-            with n3:
-                if st.button("+ Utwórz grupę", key="btn_new_group"):
-                    st.session_state["ui_show_new_group"] = True
-            # avatar line
-            st.write("")
-            avcol1, avcol2 = st.columns([0.2, 0.8])
-            with avcol1:
-                st.markdown("🙂")
-            with avcol2:
-                # simple menu alternatives as buttons (avoid custom HTML)
-                mc1, mc2, mc3 = st.columns(3)
-                with mc1:
-                    st.button("Profil", key="btn_profile")
-                with mc2:
-                    st.button("Ustawienia", key="btn_settings")
-                with mc3:
-                    if st.button("Wyloguj", key="btn_logout"):
-                        # call existing logout function if present in session namespace
-                        # NOTE: we don't change your logic – we only call helper if defined
-                        if "_session_logout" in globals():
-                            try:
-                                globals()["_session_logout"]()
-                            except Exception:
-                                pass
-                        st.rerun()
-
-    # Lightweight modals as inline forms (no custom HTML) — they only toggle flags.
-    if st.session_state.get("ui_show_new_event"):
-        with st.expander("Nowe wydarzenie", expanded=True):
-            st.write("Tu wpinamy istniejącą logikę tworzenia wydarzeń (formularz).")
-            c1, c2 = st.columns(2)
-            with c1:
-                st.button("Utwórz", key="new_event_confirm")
-            with c2:
-                if st.button("Anuluj", key="new_event_cancel"):
-                    st.session_state["ui_show_new_event"] = False
-    if st.session_state.get("ui_show_new_group"):
-        with st.expander("Utwórz grupę", expanded=True):
-            st.write("Tu wpinamy istniejącą logikę tworzenia grupy (formularz).")
-            c1, c2 = st.columns(2)
-            with c1:
-                st.button("Utwórz", key="new_group_confirm")
-            with c2:
-                if st.button("Anuluj", key="new_group_cancel"):
-                    st.session_state["ui_show_new_group"] = False
