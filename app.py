@@ -1,5 +1,5 @@
 # app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/SQLite)
-# Wersja: 2025-09-27 (cookie auth + weekly upcoming + slots autogen + teams/goals + stats)
+# Wersja: 2025-09-27 (cookie auth + 7d upcoming + slots autogen + teams/goals + stats W/L)
 
 import os
 import re
@@ -196,7 +196,6 @@ def _jwt_verify(token: str, key: str) -> Optional[dict]:
         return None
 
 def _write_cookie_and_url(token: str, max_days: int):
-    # Ustaw cookie oraz ?auth=... (mirroring)
     max_age = max_days * 24 * 3600
     js = f"""
     <script>
@@ -234,7 +233,6 @@ def _clear_cookie_and_url():
     components.html(js, height=0)
 
 def _ensure_auth_param_from_cookie():
-    # Przy starcie: jeśli mamy cookie, ale brak ?auth → dopisz do URL (soft replace, bez przeładowania jeśli możliwe)
     js = f"""
     <script>
     (function(){{
@@ -270,7 +268,6 @@ def _session_logout():
     st.stop()
 
 def _try_auto_login_from_auth_param():
-    # wywoływane bardzo wcześnie (przed sidebar)
     if "user_id" in st.session_state:
         return
     qp = st.query_params
@@ -417,7 +414,7 @@ join_requests = Table(
 )
 
 # ---------------------------
-# Inicjalizacja
+# Inicjalizacja / migracje
 # ---------------------------
 def init_db():
     metadata.create_all(engine)
@@ -471,11 +468,6 @@ def next_dates_for_weekday_range(start_from: date, weekday: int, until: date) ->
         out.append(d)
         d = d + timedelta(days=7)
     return out
-
-def week_bounds(d: date) -> Tuple[date, date]:
-    monday = d - timedelta(days=(d.weekday() % 7))
-    sunday = monday + timedelta(days=6)
-    return monday, sunday
 
 # ---------------------------
 # E-mail
@@ -738,7 +730,7 @@ def user_has_unpaid_past(user_id: int, group_id: int) -> bool:
         return bool(conn.execute(text(sql), {"u": int(user_id), "g": int(group_id)}).scalar_one())
 
 # ---------------------------
-# Mutacje
+# Mutacje: użytkownicy / grupy / sloty / zapisy / płatności / drużyny / gole
 # ---------------------------
 def ensure_user_with_password(name: str, email: str, password: str) -> int:
     if not validate_email(email):
@@ -854,10 +846,6 @@ def create_events_from_slots_until(group_id: int, horizon_days: int):
                         )
                     )
 
-def _event_current_count(conn, event_id: int) -> int:
-    return int(conn.execute(text(f"SELECT COUNT(*) FROM {T('event_signups')} WHERE event_id=:e"), {"e": int(event_id)}).scalar_one())
-
-# ---- prośby o dołączenie ----
 def request_to_join(group_id: int, user_id: int, message: str) -> Tuple[bool, str]:
     now = datetime.now()
     with engine.begin() as conn:
@@ -920,7 +908,9 @@ def reject_request(request_id: int, moderator_id: int) -> Tuple[bool, str]:
         conn.execute(update(join_requests).where(join_requests.c.id == int(jr.id)).values(status="rejected", decided_at=now))
     return True, "Odrzucono prośbę."
 
-# ---- zapisy ----
+def _event_current_count(conn, event_id: int) -> int:
+    return int(conn.execute(text(f"SELECT COUNT(*) FROM {T('event_signups')} WHERE event_id=:e"), {"e": int(event_id)}).scalar_one())
+
 def sign_up(event_id: int, user_id: int) -> Tuple[bool, str]:
     now = datetime.now()
     with engine.begin() as conn:
@@ -992,7 +982,6 @@ def payment_toggle(event_id: int, user_id: int, field: str, value: int):
         conn.execute(text(f"UPDATE {T('payments')} SET {field}=:v WHERE event_id=:e AND user_id=:u"),
                      {"v": bool(value), "e": int(event_id), "u": int(user_id)})
 
-# ---- drużyny / gole ----
 def ensure_teams(conn, event_id: int):
     for idx, name in [(1, "A"), (2, "B")]:
         if not conn.execute(select(teams.c.id).where(and_(teams.c.event_id==event_id, teams.c.idx==idx))).first():
@@ -1400,7 +1389,7 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
         participants_table(int(e.group_id), event_id, show_pay=True)
 
 # ---------------------------
-# Statystyki (zakładka)
+# Statystyki (zakładka) — z Wygrane/Przegrane
 # ---------------------------
 def page_stats(group_id: int):
     st.subheader("Statystyki grupy")
@@ -1418,7 +1407,7 @@ def page_stats(group_id: int):
             ORDER BY appearances DESC, u.name
             """), conn, params={"g": int(group_id)}
         )
-        # gole/asysty "ever"
+        # gole/asysty (ever)
         ga = pd.read_sql_query(
             text(f"""
             SELECT u.id AS user_id, u.name,
@@ -1432,15 +1421,45 @@ def page_stats(group_id: int):
             GROUP BY u.id, u.name
             """), conn, params={"g": int(group_id)}
         )
-    if played.empty and ga.empty:
+        # Wygrane/Przegrane — liczymy po przypisaniu do drużyn i wynikach
+        wl = pd.read_sql_query(
+            text(f"""
+            WITH my_team AS (
+              SELECT tm.user_id, t.event_id, t.idx AS my_idx, t.goals AS my_goals
+              FROM {T('team_members')} tm
+              JOIN {T('teams')} t ON t.id=tm.team_id
+              JOIN {T('events')} e ON e.id=t.event_id AND e.group_id=:g
+            ),
+            opp AS (
+              SELECT t2.event_id, t2.idx AS opp_idx, t2.goals AS opp_goals
+              FROM {T('teams')} t2
+              JOIN {T('events')} e2 ON e2.id=t2.event_id AND e2.group_id=:g
+            )
+            SELECT u.id AS user_id, u.name,
+                   COALESCE(SUM(CASE WHEN mt.my_goals > o.opp_goals THEN 1 ELSE 0 END),0) AS wins,
+                   COALESCE(SUM(CASE WHEN mt.my_goals < o.opp_goals THEN 1 ELSE 0 END),0) AS losses
+            FROM {T('users')} u
+            JOIN {T('memberships')} m ON m.user_id=u.id AND m.group_id=:g
+            LEFT JOIN my_team mt ON mt.user_id=u.id
+            LEFT JOIN opp o ON o.event_id=mt.event_id AND o.opp_idx <> mt.my_idx
+            GROUP BY u.id, u.name
+            """), conn, params={"g": int(group_id)}
+        )
+
+    if played.empty and ga.empty and wl.empty:
         st.caption("Brak danych statystycznych.")
         return
-    df = pd.merge(played, ga, on=["user_id","name"], how="outer").fillna(0)
-    df["goals"] = df["goals"].astype(int)
-    df["assists"] = df["assists"].astype(int)
-    df["appearances"] = df["appearances"].astype(int)
+
+    df = pd.merge(played, ga, on=["user_id","name"], how="outer")
+    df = pd.merge(df, wl, on=["user_id","name"], how="outer")
+    for c in ["goals","assists","appearances","wins","losses"]:
+        if c in df.columns:
+            df[c] = df[c].fillna(0).astype(int)
+        else:
+            df[c] = 0
     st.dataframe(
-        df.rename(columns={"name":"Zawodnik", "appearances":"Wystąpienia", "goals":"Gole", "assists":"Asysty"})[["Zawodnik","Wystąpienia","Gole","Asysty"]],
+        df.rename(columns={"name":"Zawodnik", "appearances":"Wystąpienia", "goals":"Gole", "assists":"Asysty", "wins":"Wygrane", "losses":"Przegrane"})
+          [["Zawodnik","Wystąpienia","Gole","Asysty","Wygrane","Przegrane"]],
         hide_index=True, use_container_width=True
     )
 
@@ -1785,16 +1804,9 @@ def page_group_dashboard(group_id: int):
     gid, name, city, venue, weekday, start_time, price_cents, duration_minutes, blik_phone, sport, default_capacity, postal_code = \
         int(g.id), g.name, g.city, g.venue, int(g.weekday), g.start_time, int(g.price_cents), int(g.duration_minutes), g.blik_phone, g.sport, g.default_capacity, g.postal_code
 
-    # BACKFILL: jeżeli są sloty, a nie ma eventów w tym tygodniu → generuj
-    slots_df = cached_group_slots(gid)
-    df_all_pre = cached_events_df(gid, DB_SCHEMA)
-    if not slots_df.empty:
-        now = pd.Timestamp.now()
-        monday, sunday = week_bounds(now.date())
-        end_ts = pd.Timestamp(datetime.combine(sunday, dt_time.max))
-        if df_all_pre[(df_all_pre["starts_at"] >= now) & (df_all_pre["starts_at"] <= end_ts)].empty:
-            create_events_from_slots_until(gid, GEN_HORIZON_DAYS)
-            st.cache_data.clear()
+    # BACKFILL: zawsze wygeneruj do przodu (sloty -> eventy)
+    create_events_from_slots_until(gid, GEN_HORIZON_DAYS)
+    st.cache_data.clear()
 
     st.header(f"{name} — {city} · {venue} · {sport}")
     cap_txt = f" · Domyślny limit: {int(default_capacity)}" if default_capacity else ""
@@ -1824,20 +1836,23 @@ def page_group_dashboard(group_id: int):
 
     if section == "Nadchodzące":
         df_all = cached_events_df(gid, DB_SCHEMA)
+        slots_df = cached_group_slots(gid)
         if df_all.empty:
             if slots_df.empty:
                 st.info("Brak slotów w harmonogramie. Dodaj slot w „Ustawienia grupy”.")
             else:
-                st.info("Brak wydarzeń w kalendarzu (zostaną wygenerowane automatycznie). Odśwież stronę.")
+                st.info("Brak wydarzeń w kalendarzu – odśwież stronę po chwili.")
         else:
             now = pd.Timestamp.now()
-            monday, sunday = week_bounds(now.date())
-            end_ts = pd.Timestamp(datetime.combine(sunday, dt_time.max))
+            horizon_end = now + pd.Timedelta(days=7)
+            end_ts = pd.Timestamp(datetime.combine(horizon_end.date(), dt_time.max))
+
             future = df_all.loc[(df_all["starts_at"] >= now) & (df_all["starts_at"] <= end_ts)].copy()
+            future = future.sort_values("starts_at")
+
             if future.empty:
-                st.caption("Brak nadchodzących wydarzeń w tym tygodniu.")
+                st.caption("Brak nadchodzących wydarzeń w najbliższych 7 dniach.")
             else:
-                future = future.sort_values("starts_at")
                 for row in future.itertuples():
                     upcoming_event_view(int(row.id), uid, duration_minutes)
 
@@ -2037,9 +2052,7 @@ def page_group_dashboard(group_id: int):
 # ---------------------------
 def main():
     st.set_page_config("Sport Manager", layout="wide")
-    # 1) Na samym początku zsynchronizuj URL z cookie (auto-login po refreshu)
     _ensure_auth_param_from_cookie()
-    # 2) Odczytaj auth z URL i ustaw sesję (zanim coś wyrenderujemy)
     _try_auto_login_from_auth_param()
 
     init_db()
@@ -2051,7 +2064,6 @@ def main():
         st.session_state["go_groups"] = False
         st.session_state["nav"] = "Grupy"
 
-    # Sidebar: auth + filtry + nawigacja
     sidebar_auth_only()
     sidebar_filters()
 
