@@ -2151,6 +2151,38 @@ def main():
     import streamlit as st
     try:
         st.caption("🚀 main() start")
+        # --- Visible content block (safe to run even if other parts fail) ---
+        st.markdown("## Sport Manager")
+        user = st.session_state.get("user_name")
+        if user:
+            st.success(f"Witaj, **{user}**!")
+        else:
+            st.info("Jesteś niezalogowany. Użyj formularza logowania w pasku bocznym.")
+        # Try render auth + filters if available
+        try:
+            if "sidebar_auth_only" in globals():
+                sidebar_auth_only()
+            if "sidebar_filters" in globals():
+                sidebar_filters()
+        except Exception as _e:
+            st.warning(f"UI (auth/filters) błąd: {_e}")
+        # Center page selector (works even if sidebar is hidden)
+        page = st.radio("Nawigacja", ["Grupy", "Panel grupy"], horizontal=True, label_visibility="collapsed")
+        try:
+            if page == "Grupy":
+                if "page_groups" in globals():
+                    page_groups()
+                else:
+                    st.write("Widok **Grupy** nie jest zdefiniowany w tym pliku.")
+            else:
+                gid = st.session_state.get("selected_group_id")
+                if "page_group_dashboard" in globals() and gid:
+                    page_group_dashboard(int(gid))
+                else:
+                    st.write("Wybierz grupę z listy w zakładce **Grupy**.")
+        except Exception as _e2:
+            st.exception(_e2)
+        # --- End visible content block ---
         _app_main_impl()
         st.caption("✅ main() done")
     except Exception as e:
