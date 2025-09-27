@@ -31,7 +31,7 @@ from sqlalchemy.engine import Engine
 def render_bottom_nav(active: str):
     import streamlit as st
     # Global CSS: hide sidebar + footer nav styles
-    st.markdown(\"\"\"
+    st.markdown("""
     <style>
       section[data-testid="stSidebar"]{display:none!important;}
       div[data-testid="collapsedControl"]{display:none!important;}
@@ -64,19 +64,19 @@ def render_bottom_nav(active: str):
       .dot{width:28px;height:4px;border-radius:999px;background:#FFFFFF10;margin-top:4px;}
       .active .dot{background:#FFFFFF;}
     </style>
-    \"\"\", unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
 
     # Inline SVG icons (crisp on retina; color comes from stroke #fff)
-    ico_home = \"\"\"<svg width="22" height="22" viewBox="0 0 24 24" fill="none">
-      <path d="M3 11.5L12 4l9 7.5V20a2 2 0 0 1-2 2h-5v-6H10v6H5a2 2 0 0 1-2-2v-8.5z" stroke="#fff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>\"\"\"
-    ico_search = \"\"\"<svg width="22" height="22" viewBox="0 0 24 24" fill="none">
-      <circle cx="11" cy="11" r="7" stroke="#fff" stroke-width="1.6"/><path d="M20 20l-3.2-3.2" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/></svg>\"\"\"
-    ico_cal = \"\"\"<svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+    ico_home = """<svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+      <path d="M3 11.5L12 4l9 7.5V20a2 2 0 0 1-2 2h-5v-6H10v6H5a2 2 0 0 1-2-2v-8.5z" stroke="#fff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>"""
+    ico_search = """<svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+      <circle cx="11" cy="11" r="7" stroke="#fff" stroke-width="1.6"/><path d="M20 20l-3.2-3.2" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/></svg>"""
+    ico_cal = """<svg width="22" height="22" viewBox="0 0 24 24" fill="none">
       <rect x="3" y="4.5" width="18" height="16" rx="2.5" stroke="#fff" stroke-width="1.6"/>
-      <path d="M3 9h18" stroke="#fff" stroke-width="1.6"/><path d="M8 3v4M16 3v4" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/></svg>\"\"\"
-    ico_user = \"\"\"<svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+      <path d="M3 9h18" stroke="#fff" stroke-width="1.6"/><path d="M8 3v4M16 3v4" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/></svg>"""
+    ico_user = """<svg width="22" height="22" viewBox="0 0 24 24" fill="none">
       <circle cx="12" cy="8" r="3.2" stroke="#fff" stroke-width="1.6"/>
-      <path d="M5 19.2c1.8-3.8 11.2-3.8 14 0" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/></svg>\"\"\"
+      <path d="M5 19.2c1.8-3.8 11.2-3.8 14 0" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/></svg>"""
 
     def item(tab: str, label: str, svg: str):
         is_active = "active" if active == tab else ""
@@ -2138,42 +2138,4 @@ def page_group_dashboard(group_id: int):
 # ---------------------------
 def main():
     import streamlit as st
-    tab = st.experimental_get_query_params().get('tab', ['home'])[0]
-    try:
-        render_bottom_nav(tab)
-    except Exception:
-        pass
-    st.set_page_config("Sport Manager", layout="wide")
-
-    # Po wylogowaniu pomijamy auto-login przez jedną klatkę
-    if not st.session_state.get("just_logged_out", False):
-        _ensure_auth_param_from_cookie()
-        _try_auto_login_from_auth_param()
-    else:
-        st.session_state["just_logged_out"] = False
-
-    init_db()
-
-    if st.session_state.get("go_panel"):
-        st.session_state["go_panel"] = False
-        st.session_state["nav"] = "Panel grupy"
-    if st.session_state.get("go_groups"):
-        st.session_state["go_groups"] = False
-        st.session_state["nav"] = "Grupy"
-
-    sidebar_auth_only()
-    sidebar_filters()
-
-    page = st.sidebar.radio("Nawigacja", ["Grupy", "Panel grupy"], key="nav", label_visibility="collapsed")
-
-    if page == "Grupy":
-        page_groups()
-    else:
-        gid = st.session_state.get("selected_group_id")
-        if not gid:
-            st.info("Wybierz grupę z listy (Grupy) lub dołącz do jednej.")
-            return
-        page_group_dashboard(int(gid))
-
-if __name__ == "__main__":
-    main()
+    st.set_page_config(page_title='Sport Manager', layout='wide')
