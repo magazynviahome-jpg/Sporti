@@ -2157,3 +2157,4 @@ def main():
         st.error("❌ Błąd w main() — szczegóły poniżej:")
         st.exception(e)
 
+main()
