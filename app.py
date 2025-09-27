@@ -1,3 +1,4 @@
+SIDEBAR_HIDDEN = True
 # app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/SQLite)
 # Wersja: 2025-09-27 — cookie auth (bez utcnow), wylogowanie działa, sloty=>eventy 30 dni, W/R/P w statystykach,
 # brak DeltaGenerator w UI, brak SettingWithCopyWarning, poprawione tabelki
@@ -2137,5 +2138,19 @@ def page_group_dashboard(group_id: int):
 # Main
 # ---------------------------
 def main():
+    import streamlit as st
+    st.set_page_config(page_title='Sport Manager', layout='wide')
+    # --- DEBUG: widoczny baner, usuń po testach ---
+    st.caption(f'✅ App załadowana • plik: {__file__}')
+    tab = st.query_params.get('tab', ['home'])[0]
+    try:
+        render_bottom_nav(tab)
+    except Exception as _e:
+        st.warning(f'Bottom nav problem: {_e}')
+    # Główna nawigacja: jeśli sidebar ukryty, pokaż radio u góry
+    if globals().get('SIDEBAR_HIDDEN', False):
+        page = st.radio('Nawigacja', ['Grupy','Panel grupy'], horizontal=True, label_visibility='collapsed')
+    else:
+        page = None  # zostanie ustawione z sidebaru niżej
     import streamlit as st
     st.set_page_config(page_title='Sport Manager', layout='wide')
