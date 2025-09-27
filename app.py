@@ -1,5 +1,9 @@
 # app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/SQLite)
-# Wersja: 2025-09-27 (cookie auth + 7d upcoming + slots autogen + teams/goals + stats W/L)
+# Wersja: 2025-09-27 (cookie auth + 7d upcoming + slots autogen + teams/goals + stats W/D/L)
+# Zmiany w tej wersji:
+# - Statystyki: dodano "Remisy" (draws) obok Wygrane/Przegrane
+# - Zabezpieczenie przed wypisaniem DeltaGenerator (komponenty HTML nie są zwracane/drukowane)
+# - Pozostałe funkcje jak w poprzedniej wersji
 
 import os
 import re
@@ -165,7 +169,7 @@ def verify_password(password: str, salt_hex: str, key_hex: str, meta: str) -> bo
     return hmac.compare_digest(calc, expected)
 
 # ---------------------------
-# JWT + Cookie helpers
+# JWT + Cookie helpers (bez zwracania DeltaGenerator)
 # ---------------------------
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
@@ -195,6 +199,10 @@ def _jwt_verify(token: str, key: str) -> Optional[dict]:
     except Exception:
         return None
 
+def _components_html_silent(html: str, height: int = 0):
+    # Nie zwraca obiektu DG — nic nie wypisze
+    components.html(html, height=height)
+
 def _write_cookie_and_url(token: str, max_days: int):
     max_age = max_days * 24 * 3600
     js = f"""
@@ -208,14 +216,12 @@ def _write_cookie_and_url(token: str, max_days: int):
         if (url.searchParams.get('auth') !== tok) {{
           url.searchParams.set('auth', tok);
           window.location.replace(url.toString());
-        }} else {{
-          window.parent.postMessage({{"ok":true}}, "*");
         }}
       }} catch(e) {{ console.error(e); }}
     }})();
     </script>
     """
-    components.html(js, height=0)
+    _components_html_silent(js, height=0)
 
 def _clear_cookie_and_url():
     js = f"""
@@ -230,7 +236,7 @@ def _clear_cookie_and_url():
     }})();
     </script>
     """
-    components.html(js, height=0)
+    _components_html_silent(js, height=0)
 
 def _ensure_auth_param_from_cookie():
     js = f"""
@@ -250,7 +256,7 @@ def _ensure_auth_param_from_cookie():
     }})();
     </script>
     """
-    components.html(js, height=0)
+    _components_html_silent(js, height=0)
 
 def _session_login(uid: int, name: str, email: str, remember_days: int = COOKIE_MAX_DAYS):
     st.session_state["user_id"] = uid
@@ -730,7 +736,7 @@ def user_has_unpaid_past(user_id: int, group_id: int) -> bool:
         return bool(conn.execute(text(sql), {"u": int(user_id), "g": int(group_id)}).scalar_one())
 
 # ---------------------------
-# Mutacje: użytkownicy / grupy / sloty / zapisy / płatności / drużyny / gole
+# Mutacje i logika domenowa (użytkownicy / grupy / sloty / zapisy / płatności / drużyny / gole)
 # ---------------------------
 def ensure_user_with_password(name: str, email: str, password: str) -> int:
     if not validate_email(email):
@@ -1389,12 +1395,12 @@ def past_event_view(event_id: int, uid: int, duration_minutes: int, is_mod: bool
         participants_table(int(e.group_id), event_id, show_pay=True)
 
 # ---------------------------
-# Statystyki (zakładka) — z Wygrane/Przegrane
+# Statystyki (zakładka) — z Wygrane/Remisy/Przegrane
 # ---------------------------
 def page_stats(group_id: int):
     st.subheader("Statystyki grupy")
     with engine.begin() as conn:
-        # wystąpienia = liczba zapisów w grupie
+        # wystąpienia
         played = pd.read_sql_query(
             text(f"""
             SELECT u.id AS user_id, u.name, COUNT(es.event_id) AS appearances
@@ -1407,7 +1413,7 @@ def page_stats(group_id: int):
             ORDER BY appearances DESC, u.name
             """), conn, params={"g": int(group_id)}
         )
-        # gole/asysty (ever)
+        # gole/asysty
         ga = pd.read_sql_query(
             text(f"""
             SELECT u.id AS user_id, u.name,
@@ -1421,7 +1427,7 @@ def page_stats(group_id: int):
             GROUP BY u.id, u.name
             """), conn, params={"g": int(group_id)}
         )
-        # Wygrane/Przegrane — liczymy po przypisaniu do drużyn i wynikach
+        # W/D/L
         wl = pd.read_sql_query(
             text(f"""
             WITH my_team AS (
@@ -1437,6 +1443,7 @@ def page_stats(group_id: int):
             )
             SELECT u.id AS user_id, u.name,
                    COALESCE(SUM(CASE WHEN mt.my_goals > o.opp_goals THEN 1 ELSE 0 END),0) AS wins,
+                   COALESCE(SUM(CASE WHEN mt.my_goals = o.opp_goals THEN 1 ELSE 0 END),0) AS draws,
                    COALESCE(SUM(CASE WHEN mt.my_goals < o.opp_goals THEN 1 ELSE 0 END),0) AS losses
             FROM {T('users')} u
             JOIN {T('memberships')} m ON m.user_id=u.id AND m.group_id=:g
@@ -1452,14 +1459,21 @@ def page_stats(group_id: int):
 
     df = pd.merge(played, ga, on=["user_id","name"], how="outer")
     df = pd.merge(df, wl, on=["user_id","name"], how="outer")
-    for c in ["goals","assists","appearances","wins","losses"]:
+    for c in ["goals","assists","appearances","wins","draws","losses"]:
         if c in df.columns:
             df[c] = df[c].fillna(0).astype(int)
         else:
             df[c] = 0
     st.dataframe(
-        df.rename(columns={"name":"Zawodnik", "appearances":"Wystąpienia", "goals":"Gole", "assists":"Asysty", "wins":"Wygrane", "losses":"Przegrane"})
-          [["Zawodnik","Wystąpienia","Gole","Asysty","Wygrane","Przegrane"]],
+        df.rename(columns={
+            "name":"Zawodnik",
+            "appearances":"Wystąpienia",
+            "goals":"Gole",
+            "assists":"Asysty",
+            "wins":"Wygrane",
+            "draws":"Remisy",
+            "losses":"Przegrane"
+        })[["Zawodnik","Wystąpienia","Gole","Asysty","Wygrane","Remisy","Przegrane"]],
         hide_index=True, use_container_width=True
     )
 
