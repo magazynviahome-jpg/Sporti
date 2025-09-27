@@ -1,4 +1,7 @@
-SIDEBAR_HIDDEN = True
+import streamlit as _st_top
+_st_top.set_page_config(page_title='Sport Manager', layout='wide')
+_st_top.markdown('<div style="padding:6px 0;color:#64748b">✅ App wystartowała • jeśli nic dalej nie widać, to błąd w main()</div>', unsafe_allow_html=True)
+
 # app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/SQLite)
 # Wersja: 2025-09-27 — cookie auth (bez utcnow), wylogowanie działa, sloty=>eventy 30 dni, W/R/P w statystykach,
 # brak DeltaGenerator w UI, brak SettingWithCopyWarning, poprawione tabelki
@@ -34,8 +37,8 @@ def render_bottom_nav(active: str):
     # Global CSS: hide sidebar + footer nav styles
     st.markdown("""
     <style>
-      section[data-testid="stSidebar"]{display:none!important;}
-      div[data-testid="collapsedControl"]{display:none!important;}
+      
+      
       :root,.stApp{background:#FFFFFF;}
       header[data-testid="stHeader"]{background:transparent;}
       .block-container{padding-bottom:88px;}
@@ -2138,19 +2141,5 @@ def page_group_dashboard(group_id: int):
 # Main
 # ---------------------------
 def main():
-    import streamlit as st
-    st.set_page_config(page_title='Sport Manager', layout='wide')
-    # --- DEBUG: widoczny baner, usuń po testach ---
-    st.caption(f'✅ App załadowana • plik: {__file__}')
-    tab = st.query_params.get('tab', ['home'])[0]
-    try:
-        render_bottom_nav(tab)
-    except Exception as _e:
-        st.warning(f'Bottom nav problem: {_e}')
-    # Główna nawigacja: jeśli sidebar ukryty, pokaż radio u góry
-    if globals().get('SIDEBAR_HIDDEN', False):
-        page = st.radio('Nawigacja', ['Grupy','Panel grupy'], horizontal=True, label_visibility='collapsed')
-    else:
-        page = None  # zostanie ustawione z sidebaru niżej
     import streamlit as st
     st.set_page_config(page_title='Sport Manager', layout='wide')
