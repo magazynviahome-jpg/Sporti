@@ -1,8 +1,82 @@
-import streamlit as _st_top
-_st_top.set_page_config(page_title='Sport Manager', layout='wide')
-_st_top.markdown('<div style="padding:6px 0;color:#64748b">✅ App wystartowała • jeśli nic dalej nie widać, to błąd w main()</div>', unsafe_allow_html=True)
-
 # app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/SQLite)
+
+# === SAFETY PATCH: zapobiegaj wyświetlaniu repr() DeltaGenerator w UI ===
+try:
+    import streamlit as _st_patch
+    from types import FunctionType as _FuncT
+    try:
+        # DeltaGenerator class (opcjonalnie, nie wszędzie jest eksportowana wprost)
+        from streamlit.delta_generator import DeltaGenerator as _DG
+    except Exception:
+        _DG = tuple()  # brak klasy — użyjemy heurystyki po nazwie
+
+    def _is_dg(obj):
+        try:
+            # sprawdzenie po klasie albo nazwie klasy
+            return (_DG and isinstance(obj, _DG)) or (obj.__class__.__name__ == "DeltaGenerator")
+        except Exception:
+            return False
+
+    def _sanitize_msg(msg):
+        # Dopuszczalne prymitywy
+        if isinstance(msg, (str, int, float, bool)):
+            return msg
+        # DeltaGenerator => nie pokaż repr, zamień na krótki komunikat
+        if _is_dg(msg):
+            return "⚠️ Wewnętrzny obiekt UI (DeltaGenerator) — komunikat zastępczy."
+        # próba konwersji na str (np. wyjątki)
+        try:
+            s = str(msg)
+        except Exception:
+            s = "⚠️ (obiekt nieprzedstawialny)"
+        # Jeśli str wygląda jak repr DeltaGenerator, podmień
+        if "DeltaGenerator(" in s or "delta_type" in s and "add_rows_metadata" in s:
+            return "⚠️ Wewnętrzny obiekt UI — komunikat zastępczy."
+        return s
+
+    # Owiń alerty: warning/info/error/success
+    def _wrap_alert(fn):
+        def _inner(msg, *a, **k):
+            msg = _sanitize_msg(msg)
+            return fn(msg, *a, **k)
+        return _inner
+
+    for _name in ("warning", "info", "error", "success"):
+        if hasattr(_st_patch, _name):
+            setattr(_st_patch, _name, _wrap_alert(getattr(_st_patch, _name)))
+
+    # Owiń st.write — ignoruj czyste DeltaGeneratory przekazane do wypisania
+    if hasattr(_st_patch, "write"):
+        _orig_write = _st_patch.write
+        def _safe_write(*args, **kwargs):
+            safe_args = []
+            for x in args:
+                if _is_dg(x):
+                    # Nie zapisuj DG do strumienia — to generuje ten długi zrzut
+                    continue
+                safe_args.append(x)
+            if not safe_args and not kwargs:
+                # gdy przekazano tylko DG — nic nie wypisuj
+                return None
+            return _orig_write(*safe_args, **kwargs)
+        _st_patch.write = _safe_write
+
+    # Wycisz help()/st.help(), żeby nie renderowały tablic metod w UI
+    import builtins as _bi
+    if hasattr(_bi, "help"):
+        def _noop_help(*a, **k):
+            return None
+        _bi.help = _noop_help
+    if hasattr(_st_patch, "help"):
+        def _noop_st_help(*a, **k):
+            return None
+        _st_patch.help = _noop_st_help
+
+except Exception as _e_patch:
+    # Nie blokuj aplikacji, jeśli patch nie zadziała
+    pass
+# === /SAFETY PATCH ===
+
 # Wersja: 2025-09-27 — cookie auth (bez utcnow), wylogowanie działa, sloty=>eventy 30 dni, W/R/P w statystykach,
 # brak DeltaGenerator w UI, brak SettingWithCopyWarning, poprawione tabelki
 
@@ -30,80 +104,6 @@ from sqlalchemy import (
     insert, update, and_, text
 )
 from sqlalchemy.engine import Engine
-
-# --- Compact Bottom Navigation (footer) — light theme, sidebar hidden ---
-def render_bottom_nav(active: str):
-    import streamlit as st
-    # Global CSS: hide sidebar + footer nav styles
-    st.markdown("""
-    <style>
-      
-      
-      :root,.stApp{background:#FFFFFF;}
-      header[data-testid="stHeader"]{background:transparent;}
-      .block-container{padding-bottom:88px;}
-      .bottom-nav{
-        position:fixed;left:0;right:0;bottom:0;
-        background:#0B1220;
-        border-top:1px solid rgba(255,255,255,.06);
-        padding:8px 14px calc(env(safe-area-inset-bottom,0px) + 8px);
-        z-index:1000;
-      }
-      .bottom-nav .row{
-        display:flex;justify-content:space-between;align-items:center;
-        max-width:900px;margin:0 auto;
-      }
-      .nav-item{
-        flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;
-        text-decoration:none;
-      }
-      .nav-ico{
-        width:26px;height:26px;display:flex;align-items:center;justify-content:center;opacity:.9;
-      }
-      .nav-label{
-        font-size:12px;font-weight:600;letter-spacing:.2px;margin-top:2px;color:#A3A7B3;
-      }
-      .active .nav-ico{opacity:1;}
-      .active .nav-label{color:#FFFFFF;}
-      .dot{width:28px;height:4px;border-radius:999px;background:#FFFFFF10;margin-top:4px;}
-      .active .dot{background:#FFFFFF;}
-    </style>
-    """, unsafe_allow_html=True)
-
-    # Inline SVG icons (crisp on retina; color comes from stroke #fff)
-    ico_home = """<svg width="22" height="22" viewBox="0 0 24 24" fill="none">
-      <path d="M3 11.5L12 4l9 7.5V20a2 2 0 0 1-2 2h-5v-6H10v6H5a2 2 0 0 1-2-2v-8.5z" stroke="#fff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>"""
-    ico_search = """<svg width="22" height="22" viewBox="0 0 24 24" fill="none">
-      <circle cx="11" cy="11" r="7" stroke="#fff" stroke-width="1.6"/><path d="M20 20l-3.2-3.2" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/></svg>"""
-    ico_cal = """<svg width="22" height="22" viewBox="0 0 24 24" fill="none">
-      <rect x="3" y="4.5" width="18" height="16" rx="2.5" stroke="#fff" stroke-width="1.6"/>
-      <path d="M3 9h18" stroke="#fff" stroke-width="1.6"/><path d="M8 3v4M16 3v4" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/></svg>"""
-    ico_user = """<svg width="22" height="22" viewBox="0 0 24 24" fill="none">
-      <circle cx="12" cy="8" r="3.2" stroke="#fff" stroke-width="1.6"/>
-      <path d="M5 19.2c1.8-3.8 11.2-3.8 14 0" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/></svg>"""
-
-    def item(tab: str, label: str, svg: str):
-        is_active = "active" if active == tab else ""
-        return f'''
-        <a class="nav-item {is_active}" href="?tab={tab}">
-          <div class="nav-ico">{svg}</div>
-          <div class="nav-label">{label}</div>
-          <div class="dot"></div>
-        </a>'''
-
-    html = f'''
-    <nav class="bottom-nav">
-      <div class="row">
-        {item("home","Moje",ico_home)}
-        {item("search","Szukaj",ico_search)}
-        {item("visits","Wizyty",ico_cal)}
-        {item("profile","Profil",ico_user)}
-      </div>
-    </nav>
-    '''
-    st.markdown(html, unsafe_allow_html=True)
-# --- /Bottom Navigation ---
-
 
 # ---------------------------
 # Sekrety / ENV
@@ -2140,53 +2140,38 @@ def page_group_dashboard(group_id: int):
 # ---------------------------
 # Main
 # ---------------------------
-
-def _app_main_impl():
-    import streamlit as st
-    st.set_page_config(page_title='Sport Manager', layout='wide')
-
-
-
 def main():
-    import streamlit as st
-    try:
-        st.caption("🚀 main() start")
-        # --- Visible content block (safe to run even if other parts fail) ---
-        st.markdown("## Sport Manager")
-        user = st.session_state.get("user_name")
-        if user:
-            st.success(f"Witaj, **{user}**!")
-        else:
-            st.info("Jesteś niezalogowany. Użyj formularza logowania w pasku bocznym.")
-        # Try render auth + filters if available
-        try:
-            if "sidebar_auth_only" in globals():
-                sidebar_auth_only()
-            if "sidebar_filters" in globals():
-                sidebar_filters()
-        except Exception as _e:
-            st.warning(f"UI (auth/filters) błąd: {_e}")
-        # Center page selector (works even if sidebar is hidden)
-        page = st.radio("Nawigacja", ["Grupy", "Panel grupy"], horizontal=True, label_visibility="collapsed")
-        try:
-            if page == "Grupy":
-                if "page_groups" in globals():
-                    page_groups()
-                else:
-                    st.write("Widok **Grupy** nie jest zdefiniowany w tym pliku.")
-            else:
-                gid = st.session_state.get("selected_group_id")
-                if "page_group_dashboard" in globals() and gid:
-                    page_group_dashboard(int(gid))
-                else:
-                    st.write("Wybierz grupę z listy w zakładce **Grupy**.")
-        except Exception as _e2:
-            st.exception(_e2)
-        # --- End visible content block ---
-        _app_main_impl()
-        st.caption("✅ main() done")
-    except Exception as e:
-        st.error("❌ Błąd w main() — szczegóły poniżej:")
-        st.exception(e)
+    st.set_page_config("Sport Manager", layout="wide")
 
-main()
+    # Po wylogowaniu pomijamy auto-login przez jedną klatkę
+    if not st.session_state.get("just_logged_out", False):
+        _ensure_auth_param_from_cookie()
+        _try_auto_login_from_auth_param()
+    else:
+        st.session_state["just_logged_out"] = False
+
+    init_db()
+
+    if st.session_state.get("go_panel"):
+        st.session_state["go_panel"] = False
+        st.session_state["nav"] = "Panel grupy"
+    if st.session_state.get("go_groups"):
+        st.session_state["go_groups"] = False
+        st.session_state["nav"] = "Grupy"
+
+    sidebar_auth_only()
+    sidebar_filters()
+
+    page = st.sidebar.radio("Nawigacja", ["Grupy", "Panel grupy"], key="nav", label_visibility="collapsed")
+
+    if page == "Grupy":
+        page_groups()
+    else:
+        gid = st.session_state.get("selected_group_id")
+        if not gid:
+            st.info("Wybierz grupę z listy (Grupy) lub dołącz do jednej.")
+            return
+        page_group_dashboard(int(gid))
+
+if __name__ == "__main__":
+    main()
