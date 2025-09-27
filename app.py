@@ -1,82 +1,4 @@
 # app.py — Sport Manager (Streamlit + SQLAlchemy + Postgres/SQLite)
-
-# === SAFETY PATCH: zapobiegaj wyświetlaniu repr() DeltaGenerator w UI ===
-try:
-    import streamlit as _st_patch
-    from types import FunctionType as _FuncT
-    try:
-        # DeltaGenerator class (opcjonalnie, nie wszędzie jest eksportowana wprost)
-        from streamlit.delta_generator import DeltaGenerator as _DG
-    except Exception:
-        _DG = tuple()  # brak klasy — użyjemy heurystyki po nazwie
-
-    def _is_dg(obj):
-        try:
-            # sprawdzenie po klasie albo nazwie klasy
-            return (_DG and isinstance(obj, _DG)) or (obj.__class__.__name__ == "DeltaGenerator")
-        except Exception:
-            return False
-
-    def _sanitize_msg(msg):
-        # Dopuszczalne prymitywy
-        if isinstance(msg, (str, int, float, bool)):
-            return msg
-        # DeltaGenerator => nie pokaż repr, zamień na krótki komunikat
-        if _is_dg(msg):
-            return "⚠️ Wewnętrzny obiekt UI (DeltaGenerator) — komunikat zastępczy."
-        # próba konwersji na str (np. wyjątki)
-        try:
-            s = str(msg)
-        except Exception:
-            s = "⚠️ (obiekt nieprzedstawialny)"
-        # Jeśli str wygląda jak repr DeltaGenerator, podmień
-        if "DeltaGenerator(" in s or "delta_type" in s and "add_rows_metadata" in s:
-            return "⚠️ Wewnętrzny obiekt UI — komunikat zastępczy."
-        return s
-
-    # Owiń alerty: warning/info/error/success
-    def _wrap_alert(fn):
-        def _inner(msg, *a, **k):
-            msg = _sanitize_msg(msg)
-            return fn(msg, *a, **k)
-        return _inner
-
-    for _name in ("warning", "info", "error", "success"):
-        if hasattr(_st_patch, _name):
-            setattr(_st_patch, _name, _wrap_alert(getattr(_st_patch, _name)))
-
-    # Owiń st.write — ignoruj czyste DeltaGeneratory przekazane do wypisania
-    if hasattr(_st_patch, "write"):
-        _orig_write = _st_patch.write
-        def _safe_write(*args, **kwargs):
-            safe_args = []
-            for x in args:
-                if _is_dg(x):
-                    # Nie zapisuj DG do strumienia — to generuje ten długi zrzut
-                    continue
-                safe_args.append(x)
-            if not safe_args and not kwargs:
-                # gdy przekazano tylko DG — nic nie wypisuj
-                return None
-            return _orig_write(*safe_args, **kwargs)
-        _st_patch.write = _safe_write
-
-    # Wycisz help()/st.help(), żeby nie renderowały tablic metod w UI
-    import builtins as _bi
-    if hasattr(_bi, "help"):
-        def _noop_help(*a, **k):
-            return None
-        _bi.help = _noop_help
-    if hasattr(_st_patch, "help"):
-        def _noop_st_help(*a, **k):
-            return None
-        _st_patch.help = _noop_st_help
-
-except Exception as _e_patch:
-    # Nie blokuj aplikacji, jeśli patch nie zadziała
-    pass
-# === /SAFETY PATCH ===
-
 # Wersja: 2025-09-27 — cookie auth (bez utcnow), wylogowanie działa, sloty=>eventy 30 dni, W/R/P w statystykach,
 # brak DeltaGenerator w UI, brak SettingWithCopyWarning, poprawione tabelki
 
@@ -104,6 +26,52 @@ from sqlalchemy import (
     insert, update, and_, text
 )
 from sqlalchemy.engine import Engine
+
+# === UI PATCH: Hide sidebar, light theme polish, top-bar spacing ===
+import streamlit as _st_css_only
+_st_css_only.markdown('''
+<style>
+/* Hide the sidebar and its toggle completely */
+section[data-testid="stSidebar"] { display:none !important; }
+div[data-testid="collapsedControl"] { display:none !important; }
+
+/* Light theme polish for cards and headers */
+:root, .stApp { background: #FFFFFF; }
+.block-container { padding-top: 0.5rem; padding-bottom: 2rem; }
+
+/* Top bar wrapper */
+.topbar {
+  position: sticky; top: 0; z-index: 999;
+  backdrop-filter: saturate(150%) blur(6px);
+  background: rgba(255,255,255,0.85);
+  border-bottom: 1px solid #E5E7EB;
+  padding: 8px 0;
+}
+
+/* Pills (segmented control look) */
+.pill {
+  border: 1px solid #E5E7EB; border-radius: 999px;
+  padding: 6px 12px; margin-right: 6px; cursor: pointer;
+  font-weight: 600; color: #475569;
+}
+.pill.active { background: #2563EB; color: #fff; border-color: #2563EB; }
+
+/* Buttons look */
+.btn-primary {
+  background: #2563EB; color: #fff; border-radius: 10px; padding: 8px 12px;
+  border: 1px solid #1D4ED8; font-weight: 600;
+}
+.btn-ghost {
+  background: transparent; color: #0F172A; border-radius: 10px; padding: 8px 12px;
+  border: 1px solid #E5E7EB; font-weight: 600;
+}
+
+/* Reduce excessive gap above first element */
+header[data-testid="stHeader"] { background: transparent; }
+</style>
+''', unsafe_allow_html=True)
+# === /UI PATCH ===
+
 
 # ---------------------------
 # Sekrety / ENV
@@ -2141,6 +2109,7 @@ def page_group_dashboard(group_id: int):
 # Main
 # ---------------------------
 def main():
+    _render_topbar()
     st.set_page_config("Sport Manager", layout="wide")
 
     # Po wylogowaniu pomijamy auto-login przez jedną klatkę
@@ -2175,3 +2144,92 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+def _render_topbar():
+    import streamlit as st
+    from datetime import datetime
+
+    # wrapper for sticky area
+    st.markdown('<div class="topbar"></div>', unsafe_allow_html=True)
+    with st.container():
+        left, center, right = st.columns([1.2, 2, 1.3], gap="large")
+        with left:
+            c1, c2 = st.columns([0.24, 0.76])
+            with c1:
+                st.markdown("🟢")  # placeholder logo (emoji). Replace with image if you have.
+            with c2:
+                st.markdown("### **Sport Manager**")
+                # optional status chip under name (kept minimal)
+                # st.caption("Warszawa • Siatkówka")
+        with center:
+            mode = st.segmented_control(
+                label="",
+                options=["Twoje Grupy", "Szukaj grupy"],
+                key="ui_view_mode",
+                default="Twoje Grupy"
+            )
+            # persist mapping to potential existing router
+            if mode == "Twoje Grupy":
+                st.session_state["nav"] = st.session_state.get("nav", "Grupy")
+            else:
+                st.session_state["nav"] = "Szukaj grupy"
+            # in search mode, render search + filters row
+            if mode == "Szukaj grupy":
+                qcol, fcol = st.columns([4,1])
+                with qcol:
+                    st.text_input("Szukaj grupy", key="search_query", label_visibility="collapsed", placeholder="Nazwa, miasto, dyscyplina…")
+                with fcol:
+                    st.popover("Filtry").write("Tu dodamy filtry: Dyscyplina, Miasto, Daty")
+        with right:
+            n1, n2, n3 = st.columns([0.5, 1.2, 1.2])
+            with n1:
+                # dummy notifications bell; the real counter can read your existing state
+                st.button("🔔", key="notif_bell", help="Powiadomienia")
+            with n2:
+                if st.button("+ Nowe wydarzenie", key="btn_new_event"):
+                    st.session_state["ui_show_new_event"] = True
+            with n3:
+                if st.button("+ Utwórz grupę", key="btn_new_group"):
+                    st.session_state["ui_show_new_group"] = True
+            # avatar line
+            st.write("")
+            avcol1, avcol2 = st.columns([0.2, 0.8])
+            with avcol1:
+                st.markdown("🙂")
+            with avcol2:
+                # simple menu alternatives as buttons (avoid custom HTML)
+                mc1, mc2, mc3 = st.columns(3)
+                with mc1:
+                    st.button("Profil", key="btn_profile")
+                with mc2:
+                    st.button("Ustawienia", key="btn_settings")
+                with mc3:
+                    if st.button("Wyloguj", key="btn_logout"):
+                        # call existing logout function if present in session namespace
+                        # NOTE: we don't change your logic – we only call helper if defined
+                        if "_session_logout" in globals():
+                            try:
+                                globals()["_session_logout"]()
+                            except Exception:
+                                pass
+                        st.rerun()
+
+    # Lightweight modals as inline forms (no custom HTML) — they only toggle flags.
+    if st.session_state.get("ui_show_new_event"):
+        with st.expander("Nowe wydarzenie", expanded=True):
+            st.write("Tu wpinamy istniejącą logikę tworzenia wydarzeń (formularz).")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.button("Utwórz", key="new_event_confirm")
+            with c2:
+                if st.button("Anuluj", key="new_event_cancel"):
+                    st.session_state["ui_show_new_event"] = False
+    if st.session_state.get("ui_show_new_group"):
+        with st.expander("Utwórz grupę", expanded=True):
+            st.write("Tu wpinamy istniejącą logikę tworzenia grupy (formularz).")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.button("Utwórz", key="new_group_confirm")
+            with c2:
+                if st.button("Anuluj", key="new_group_cancel"):
+                    st.session_state["ui_show_new_group"] = False
